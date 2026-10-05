@@ -8,15 +8,34 @@ local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local Players = game:GetService("Players")
 local VirtualUser = game:GetService("VirtualUser")
+local TeleportService = game:GetService("TeleportService")
 local player = Players.LocalPlayer
 local PlayerGui = player:WaitForChild("PlayerGui")
 local CoreGui = game:GetService("CoreGui")
 
--- [ 1. STORAGE SYSTEM ]
+-- [ 1. STORAGE SYSTEM & ANIMATION BLACKLIST ]
 local FILENAME = "AutoLead.json"
 local SETTINGS_FILENAME = "AutoLeadSettings.json"
 local SavedData = {}
 local ExcludedRandomSongs = {}
+
+-- Daftar ID Animasi yang ingin dikecualikan (Blacklist Animasi)
+local IgnoredAnimationIds = {
+    ["rbxassetid://129428669558166"] = true,
+    ["rbxassetid://106189728096125"] = true,
+    ["129428669558166"] = true,
+    ["106189728096125"] = true,
+}
+
+local function IsAnimationIgnored(animId)
+    if not animId then return false end
+    local cleanId = tostring(animId)
+    if IgnoredAnimationIds[cleanId] then return true end
+    -- Cek jika formatnya mengandung angka murni
+    local pureNum = cleanId:match("%d+")
+    if pureNum and IgnoredAnimationIds[pureNum] then return true end
+    return false
+end
 
 local function Load()
     if isfile and isfile(FILENAME) then
@@ -51,7 +70,7 @@ end
 
 Load()
 
--- [ HELPER FORMAT & PARSE TIME ]
+-- [ HELPER FORMAT, PARSE TIME & CLEAN SONG NAME ]
 local function FormatTime(seconds)
     local totalSecs = tonumber(seconds) or 0
     local mins = math.floor(totalSecs / 60)
@@ -74,6 +93,23 @@ local function ParseSeekInput(inputStr)
     else
         return tonumber(cleanStr) or 0
     end
+end
+
+local function CleanSongName(rawName)
+    if not rawName then return "" end
+    local text = tostring(rawName)
+    text = text:gsub("%b[]", "")
+    text = text:gsub("^%s*(.-)%s*$", "%1")
+    return text
+end
+
+local function CleanAndNormalize(str)
+    if not str then return "" end
+    local text = tostring(str):lower()
+    text = text:gsub("[%[%]%(%)%-%_%%#%.%?!]", " ")
+    text = text:gsub("^%s*(.-)%s*$", "%1")
+    text = text:gsub("%s+", " ")
+    return text
 end
 
 -- [ 2. UI SETUP ]
@@ -108,7 +144,7 @@ TitleLabel.Size = UDim2.new(1, -75, 1, 0)
 TitleLabel.Position = UDim2.new(0, 14, 0, 0)
 TitleLabel.BackgroundTransparency = 1
 TitleLabel.BorderSizePixel = 0
-TitleLabel.Text = "AUTO LEAD <font color='#00ffaa'>✨ Pro v6.2</font>"
+TitleLabel.Text = "AUTO LEAD <font color='#00ffaa'>✨ CIDRO JANJI</font>"
 TitleLabel.RichText = true
 TitleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 TitleLabel.Font = Enum.Font.FredokaOne
@@ -122,8 +158,6 @@ local RunPlayback
 local UpdateQuickDropdownList
 local RecSelect
 local EditSelect
-local SettingDropdown
-local RefreshSettingDropdown
 local RefreshBlacklistDisplay
 local QuickSearchBox
 local QuickListFrame
@@ -132,6 +166,9 @@ local IsAutoRemoteRecordEnabled = false
 local RemoteConnection = nil
 local AutoRecordConnection = nil
 local AntiAfkConnection = nil
+local AntiAfkTimerThread = nil
+local IsAfkActive = false
+local IsAntiAfkActive = true
 
 local CloseBtn = Instance.new("TextButton", TopBar)
 CloseBtn.Size = UDim2.new(0, 26, 0, 26)
@@ -167,7 +204,7 @@ HideBtn.MouseButton1Click:Connect(function()
     MainFrame.Visible = false
 end)
 
--- Top Horizontal Tab Bar Container
+-- Top Horizontal Tab Bar Container (5 Tab)
 local TabBar = Instance.new("Frame", MainFrame)
 TabBar.Size = UDim2.new(1, -16, 0, 32)
 TabBar.Position = UDim2.new(0, 8, 0, 44)
@@ -181,7 +218,7 @@ TabBarLayout.SortOrder = Enum.SortOrder.LayoutOrder
 TabBarLayout.FillDirection = Enum.FillDirection.Horizontal
 TabBarLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
 TabBarLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-TabBarLayout.Padding = UDim.new(0, 4)
+TabBarLayout.Padding = UDim.new(0, 3)
 
 -- Content Area Panels
 local ContentArea = Instance.new("Frame", MainFrame)
@@ -214,14 +251,14 @@ local function CreateTabPanel(name, index, onSelectedCallback)
     layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(UpdateCanvas)
     
     local tBtn = Instance.new("TextButton", TabBar)
-    tBtn.Size = UDim2.new(0.23, 0, 0.8, 0)
+    tBtn.Size = UDim2.new(0.188, 0, 0.8, 0)
     tBtn.BackgroundColor3 = (index == 1) and Color3.fromRGB(60, 60, 72) or Color3.fromRGB(18, 18, 22)
     tBtn.BackgroundTransparency = (index == 1) and 0.1 or 0.6
     tBtn.BorderSizePixel = 0
     tBtn.Text = name
     tBtn.TextColor3 = (index == 1) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 165)
     tBtn.Font = Enum.Font.GothamBold
-    tBtn.TextSize = 9
+    tBtn.TextSize = 8
     Instance.new("UICorner", tBtn).CornerRadius = UDim.new(0, 6)
     
     tBtn.MouseButton1Click:Connect(function()
@@ -244,6 +281,8 @@ local function CreateTabPanel(name, index, onSelectedCallback)
     return page, UpdateCanvas
 end
 
+local RefreshPlayerList = nil
+
 local Tabs = {
     Main = CreateTabPanel("REC", 1),
     Editor = CreateTabPanel("EDIT", 2, function()
@@ -256,14 +295,17 @@ local Tabs = {
     end),
     Setting = CreateTabPanel("SETTING", 4, function()
         Load()
-        if RefreshSettingDropdown then RefreshSettingDropdown() end
+        if RefreshBlacklistDisplay then RefreshBlacklistDisplay() end
+    end),
+    Player = CreateTabPanel("PLAYER", 5, function()
+        if RefreshPlayerList then RefreshPlayerList() end
     end)
 }
 
 -- Helper Component Generators
 local function AddSectionHeader(parent, text)
     local lbl = Instance.new("TextLabel", parent)
-    lbl.Size = UDim2.new(1, 0, 0, 24)
+    lbl.Size = UDim2.new(1, -4, 0, 24)
     lbl.BackgroundTransparency = 1
     lbl.BorderSizePixel = 0
     lbl.Text = "  " .. text
@@ -297,7 +339,7 @@ local function AddDualButtonUI(parent, leftTitle, leftColor, leftCallback, right
     container.BorderSizePixel = 0
     
     local leftBtn = Instance.new("TextButton", container)
-    leftBtn.Size = UDim2.new(0.68, -3, 1, 0)
+    leftBtn.Size = UDim2.new(0.48, 0, 1, 0)
     leftBtn.Position = UDim2.new(0, 0, 0, 0)
     leftBtn.BackgroundColor3 = leftColor or Color3.fromRGB(50, 160, 100)
     leftBtn.BackgroundTransparency = 0.45
@@ -305,20 +347,20 @@ local function AddDualButtonUI(parent, leftTitle, leftColor, leftCallback, right
     leftBtn.Text = leftTitle
     leftBtn.TextColor3 = Color3.fromRGB(245, 255, 248)
     leftBtn.Font = Enum.Font.GothamBold
-    leftBtn.TextSize = 11
+    leftBtn.TextSize = 10
     Instance.new("UICorner", leftBtn).CornerRadius = UDim.new(0, 7)
     leftBtn.MouseButton1Click:Connect(leftCallback)
     
     local rightBtn = Instance.new("TextButton", container)
-    rightBtn.Size = UDim2.new(0.32, -3, 1, 0)
-    rightBtn.Position = UDim2.new(0.68, 3, 0, 0)
+    rightBtn.Size = UDim2.new(0.48, 0, 1, 0)
+    rightBtn.Position = UDim2.new(0.52, 0, 0, 0)
     rightBtn.BackgroundColor3 = rightColor or Color3.fromRGB(180, 70, 70)
     rightBtn.BackgroundTransparency = 0.45
     rightBtn.BorderSizePixel = 0
     rightBtn.Text = rightTitle
     rightBtn.TextColor3 = Color3.fromRGB(255, 245, 245)
     rightBtn.Font = Enum.Font.GothamBold
-    rightBtn.TextSize = 11
+    rightBtn.TextSize = 10
     Instance.new("UICorner", rightBtn).CornerRadius = UDim.new(0, 7)
     rightBtn.MouseButton1Click:Connect(rightCallback)
     
@@ -365,7 +407,17 @@ local function AddToggleUI(parent, title, defaultState, callback)
         if callback then callback(toggled) end
     end)
     
-    return { Value = toggled }
+    local toggleObj = {
+        Value = toggled,
+        SetValue = function(self, val)
+            toggled = val
+            self.Value = val
+            switch.BackgroundColor3 = toggled and Color3.fromRGB(50, 160, 100) or Color3.fromRGB(60, 60, 70)
+            switch.BackgroundTransparency = toggled and 0.3 or 0.4
+            switch.Text = toggled and "ON" or "OFF"
+        end
+    }
+    return toggleObj
 end
 
 local function AddBigRecordToggle(parent, callback)
@@ -1027,7 +1079,6 @@ local CurrentPlaybackThread = nil
 local TempSession = {}
 local StartTime = 0
 local CharacterConnection = nil
-local IsFromRandomLoop = false
 
 -- TAB 1: RECORDER
 local RecToggle = AddBigRecordToggle(Tabs.Main, function(value)
@@ -1162,7 +1213,8 @@ AddToggleUI(Tabs.Main, "AUTO RECORD VIA REMOTE", false, function(Value)
                     
                     if rawName == "" or rawName == "nil" then return end
                     
-                    local songName = string.gsub(rawName, "^%s*(.-)%s*$", "%1")
+                    local songName = CleanSongName(rawName)
+                    if songName == "" then return end
                     
                     if IsRecording and currentAutoRecordSong and currentAutoRecordSong ~= songName then
                         if #TempSession > 0 then
@@ -1244,10 +1296,349 @@ AddButtonUI(Tabs.Editor, "📝 GANTI NAMA (RENAME)", function()
 end)
 
 AddSectionHeader(Tabs.Editor, "EDITOR")
-AddButtonUI(Tabs.Editor, "🛠 BUKA TIMELINE", function() end)
+
+local function OpenTimelineEditor(recordName)
+    if not recordName or recordName == "" or not SavedData[recordName] then
+        Notify({Title="ERROR", Content="Pilih rekaman terlebih dahulu di tab EDIT!", Color=Color3.fromRGB(200, 50, 50)})
+        return
+    end
+    
+    local timelineGui = Instance.new("Frame", ScreenGui)
+    timelineGui.Size = UDim2.fromOffset(340, 415)
+    timelineGui.Position = UDim2.new(0.5, -170, 0.5, -207)
+    timelineGui.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+    timelineGui.BackgroundTransparency = 0.1
+    timelineGui.BorderSizePixel = 0
+    timelineGui.ZIndex = 200
+    Instance.new("UICorner", timelineGui).CornerRadius = UDim.new(0, 12)
+    
+    local tStroke = Instance.new("UIStroke", timelineGui)
+    tStroke.Color = Color3.fromRGB(0, 255, 170)
+    tStroke.Transparency = 0.3
+    tStroke.Thickness = 1.8
+    
+    local headerLbl = Instance.new("TextLabel", timelineGui)
+    headerLbl.Size = UDim2.new(1, -80, 0, 38)
+    headerLbl.Position = UDim2.new(0, 12, 0, 0)
+    headerLbl.BackgroundTransparency = 1
+    headerLbl.Text = "🛠 EDIT: " .. string.upper(recordName)
+    headerLbl.TextColor3 = Color3.fromRGB(0, 255, 170)
+    headerLbl.Font = Enum.Font.FredokaOne
+    headerLbl.TextSize = 11
+    headerLbl.TextXAlignment = Enum.TextXAlignment.Left
+    headerLbl.ZIndex = 201
+    
+    local sortBtn = Instance.new("TextButton", timelineGui)
+    sortBtn.Size = UDim2.new(0, 40, 0, 26)
+    sortBtn.Position = UDim2.new(1, -72, 0, 6)
+    sortBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+    sortBtn.BackgroundTransparency = 0.2
+    sortBtn.BorderSizePixel = 0
+    sortBtn.Text = "🔄 Sort"
+    sortBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    sortBtn.Font = Enum.Font.GothamBold
+    sortBtn.TextSize = 9
+    sortBtn.ZIndex = 201
+    Instance.new("UICorner", sortBtn).CornerRadius = UDim.new(0, 5)
+
+    local closeTimelineBtn = Instance.new("TextButton", timelineGui)
+    closeTimelineBtn.Size = UDim2.new(0, 26, 0, 26)
+    closeTimelineBtn.Position = UDim2.new(1, -28, 0, 6)
+    closeTimelineBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    closeTimelineBtn.BackgroundTransparency = 0.2
+    closeTimelineBtn.BorderSizePixel = 0
+    closeTimelineBtn.Text = "×"
+    closeTimelineBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeTimelineBtn.Font = Enum.Font.FredokaOne
+    closeTimelineBtn.TextSize = 16
+    closeTimelineBtn.ZIndex = 201
+    Instance.new("UICorner", closeTimelineBtn).CornerRadius = UDim.new(0, 6)
+    
+    local tableHeader = Instance.new("Frame", timelineGui)
+    tableHeader.Size = UDim2.new(1, -24, 0, 24)
+    tableHeader.Position = UDim2.new(0, 12, 0, 38)
+    tableHeader.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+    tableHeader.BackgroundTransparency = 0.2
+    tableHeader.BorderSizePixel = 0
+    tableHeader.ZIndex = 201
+    Instance.new("UICorner", tableHeader).CornerRadius = UDim.new(0, 5)
+    
+    local function AddTh(text, posX, sizeX)
+        local th = Instance.new("TextLabel", tableHeader)
+        th.Size = UDim2.new(0, sizeX, 1, 0)
+        th.Position = UDim2.new(0, posX, 0, 0)
+        th.BackgroundTransparency = 1
+        th.Text = text
+        th.TextColor3 = Color3.fromRGB(170, 170, 185)
+        th.Font = Enum.Font.GothamBold
+        th.TextSize = 9
+        th.ZIndex = 202
+        return th
+    end
+    
+    AddTh("NO", 4, 22)
+    AddTh("WAKTU (S) & PINTASAN", 28, 125)
+    AddTh("SPD", 155, 34)
+    AddTh("URUT", 192, 38)
+    AddTh("ANIM ID", 232, 60)
+    AddTh("DEL", 294, 22)
+    
+    local listScroll = Instance.new("ScrollingFrame", timelineGui)
+    listScroll.Size = UDim2.new(1, -24, 1, -112)
+    listScroll.Position = UDim2.new(0, 12, 0, 66)
+    listScroll.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+    listScroll.BackgroundTransparency = 0.4
+    listScroll.BorderSizePixel = 0
+    listScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    listScroll.ScrollBarThickness = 3
+    listScroll.ZIndex = 201
+    Instance.new("UICorner", listScroll).CornerRadius = UDim.new(0, 6)
+    
+    local scrollLayout = Instance.new("UIListLayout", listScroll)
+    scrollLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    scrollLayout.Padding = UDim.new(0, 4)
+    
+    local editDataSession = {}
+    for _, item in ipairs(SavedData[recordName]) do
+        table.insert(editDataSession, {
+            id = item.id, 
+            time = tonumber(item.time) or 0, 
+            speed = tonumber(item.speed) or 1,
+            isNewAnim = item.isNewAnim,
+            isSpeedUpdateOnly = item.isSpeedUpdateOnly
+        })
+    end
+    
+    local RenderTimelineRows
+    
+    sortBtn.MouseButton1Click:Connect(function()
+        table.sort(editDataSession, function(a, b)
+            return (a.time or 0) < (b.time or 0)
+        end)
+        RenderTimelineRows()
+        Notify({Title="SORT", Content="Timeline diurutkan berdasarkan waktu!", Color=Color3.fromRGB(50, 160, 100)})
+    end)
+    
+    RenderTimelineRows = function()
+        for _, c in pairs(listScroll:GetChildren()) do
+            if c:IsA("Frame") then c:Destroy() end
+        end
+        
+        for idx, entry in ipairs(editDataSession) do
+            local row = Instance.new("Frame", listScroll)
+            row.Size = UDim2.new(1, 0, 0, 36)
+            row.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+            row.BackgroundTransparency = 0.3
+            row.BorderSizePixel = 0
+            row.ZIndex = 202
+            Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
+            
+            local idxLbl = Instance.new("TextLabel", row)
+            idxLbl.Size = UDim2.new(0, 22, 1, 0)
+            idxLbl.Position = UDim2.new(0, 4, 0, 0)
+            idxLbl.BackgroundTransparency = 1
+            idxLbl.Text = "#" .. idx
+            idxLbl.TextColor3 = Color3.fromRGB(140, 140, 155)
+            idxLbl.Font = Enum.Font.GothamBold
+            idxLbl.TextSize = 8
+            idxLbl.ZIndex = 203
+            
+            local timeBox = Instance.new("TextBox", row)
+            timeBox.Size = UDim2.new(0, 50, 0, 22)
+            timeBox.Position = UDim2.new(0, 28, 0.5, -11)
+            timeBox.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+            timeBox.BackgroundTransparency = 0.2
+            timeBox.BorderSizePixel = 0
+            timeBox.Text = string.format("%.1f", entry.time)
+            timeBox.PlaceholderText = "0.0"
+            timeBox.TextColor3 = Color3.fromRGB(0, 255, 170)
+            timeBox.Font = Enum.Font.GothamBold
+            timeBox.TextSize = 10
+            timeBox.ZIndex = 203
+            Instance.new("UICorner", timeBox).CornerRadius = UDim.new(0, 4)
+            
+            timeBox.FocusLost:Connect(function()
+                local newTime = tonumber(timeBox.Text)
+                if newTime then
+                    editDataSession[idx].time = math.max(0, newTime)
+                else
+                    timeBox.Text = string.format("%.1f", entry.time)
+                end
+            end)
+            
+            local minusBtn = Instance.new("TextButton", row)
+            minusBtn.Size = UDim2.new(0, 17, 0, 22)
+            minusBtn.Position = UDim2.new(0, 80, 0.5, -11)
+            minusBtn.BackgroundColor3 = Color3.fromRGB(60, 40, 40)
+            minusBtn.BackgroundTransparency = 0.3
+            minusBtn.BorderSizePixel = 0
+            minusBtn.Text = "-."
+            minusBtn.TextColor3 = Color3.fromRGB(255, 150, 150)
+            minusBtn.Font = Enum.Font.GothamBold
+            minusBtn.TextSize = 8
+            minusBtn.ZIndex = 203
+            Instance.new("UICorner", minusBtn).CornerRadius = UDim.new(0, 3)
+            
+            minusBtn.MouseButton1Click:Connect(function()
+                editDataSession[idx].time = math.max(0, (editDataSession[idx].time or 0) - 0.5)
+                timeBox.Text = string.format("%.1f", editDataSession[idx].time)
+            end)
+            
+            local plusBtn = Instance.new("TextButton", row)
+            plusBtn.Size = UDim2.new(0, 17, 0, 22)
+            plusBtn.Position = UDim2.new(0, 99, 0.5, -11)
+            plusBtn.BackgroundColor3 = Color3.fromRGB(40, 60, 50)
+            plusBtn.BackgroundTransparency = 0.3
+            plusBtn.BorderSizePixel = 0
+            plusBtn.Text = "+."
+            plusBtn.TextColor3 = Color3.fromRGB(150, 255, 180)
+            plusBtn.Font = Enum.Font.GothamBold
+            plusBtn.TextSize = 8
+            plusBtn.ZIndex = 203
+            Instance.new("UICorner", plusBtn).CornerRadius = UDim.new(0, 3)
+            
+            plusBtn.MouseButton1Click:Connect(function()
+                editDataSession[idx].time = (editDataSession[idx].time or 0) + 0.5
+                timeBox.Text = string.format("%.1f", editDataSession[idx].time)
+            end)
+            
+            local speedBox = Instance.new("TextBox", row)
+            speedBox.Size = UDim2.new(0, 34, 0, 22)
+            speedBox.Position = UDim2.new(0, 119, 0.5, -11)
+            speedBox.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+            speedBox.BackgroundTransparency = 0.2
+            speedBox.BorderSizePixel = 0
+            speedBox.Text = tostring(entry.speed)
+            speedBox.PlaceholderText = "1"
+            speedBox.TextColor3 = Color3.fromRGB(255, 200, 0)
+            speedBox.Font = Enum.Font.GothamBold
+            speedBox.TextSize = 10
+            speedBox.ZIndex = 203
+            Instance.new("UICorner", speedBox).CornerRadius = UDim.new(0, 4)
+            
+            speedBox.FocusLost:Connect(function()
+                local newSpeed = tonumber(speedBox.Text)
+                if newSpeed then
+                    editDataSession[idx].speed = newSpeed
+                else
+                    speedBox.Text = tostring(entry.speed)
+                end
+            end)
+            
+            local upBtn = Instance.new("TextButton", row)
+            upBtn.Size = UDim2.new(0, 17, 0, 22)
+            upBtn.Position = UDim2.new(0, 155, 0.5, -11)
+            upBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+            upBtn.BackgroundTransparency = 0.3
+            upBtn.BorderSizePixel = 0
+            upBtn.Text = "▲"
+            upBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            upBtn.Font = Enum.Font.GothamBold
+            upBtn.TextSize = 8
+            upBtn.ZIndex = 203
+            Instance.new("UICorner", upBtn).CornerRadius = UDim.new(0, 3)
+            
+            upBtn.MouseButton1Click:Connect(function()
+                if idx > 1 then
+                    local temp = editDataSession[idx]
+                    editDataSession[idx] = editDataSession[idx - 1]
+                    editDataSession[idx - 1] = temp
+                    RenderTimelineRows()
+                end
+            end)
+            
+            local downBtn = Instance.new("TextButton", row)
+            downBtn.Size = UDim2.new(0, 17, 0, 22)
+            downBtn.Position = UDim2.new(0, 174, 0.5, -11)
+            downBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+            downBtn.BackgroundTransparency = 0.3
+            downBtn.BorderSizePixel = 0
+            downBtn.Text = "▼"
+            downBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            downBtn.Font = Enum.Font.GothamBold
+            downBtn.TextSize = 8
+            downBtn.ZIndex = 203
+            Instance.new("UICorner", downBtn).CornerRadius = UDim.new(0, 3)
+            
+            downBtn.MouseButton1Click:Connect(function()
+                if idx < #editDataSession then
+                    local temp = editDataSession[idx]
+                    editDataSession[idx] = editDataSession[idx + 1]
+                    editDataSession[idx + 1] = temp
+                    RenderTimelineRows()
+                end
+            end)
+            
+            local idShort = tostring(entry.id):match("%d+") or tostring(entry.id)
+            local idLbl = Instance.new("TextLabel", row)
+            idLbl.Size = UDim2.new(0, 58, 1, 0)
+            idLbl.Position = UDim2.new(0, 194, 0, 0)
+            idLbl.BackgroundTransparency = 1
+            idLbl.Text = idShort
+            idLbl.TextColor3 = Color3.fromRGB(200, 200, 215)
+            idLbl.Font = Enum.Font.Gotham
+            idLbl.TextSize = 8
+            idLbl.TextXAlignment = Enum.TextXAlignment.Left
+            idLbl.TextTruncate = Enum.TextTruncate.AtEnd
+            idLbl.ZIndex = 203
+            
+            local delBtn = Instance.new("TextButton", row)
+            delBtn.Size = UDim2.new(0, 22, 0, 22)
+            delBtn.Position = UDim2.new(1, -26, 0.5, -11)
+            delBtn.BackgroundColor3 = Color3.fromRGB(180, 70, 70)
+            delBtn.BackgroundTransparency = 0.3
+            delBtn.BorderSizePixel = 0
+            delBtn.Text = "×"
+            delBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            delBtn.Font = Enum.Font.GothamBold
+            delBtn.TextSize = 12
+            delBtn.ZIndex = 203
+            Instance.new("UICorner", delBtn).CornerRadius = UDim.new(0, 4)
+            
+            delBtn.MouseButton1Click:Connect(function()
+                table.remove(editDataSession, idx)
+                RenderTimelineRows()
+            end)
+        end
+        
+        listScroll.CanvasSize = UDim2.new(0, 0, 0, #editDataSession * 40)
+    end
+    
+    RenderTimelineRows()
+    
+    local saveTimelineBtn = Instance.new("TextButton", timelineGui)
+    saveTimelineBtn.Size = UDim2.new(1, -24, 0, 32)
+    saveTimelineBtn.Position = UDim2.new(0, 12, 1, -38)
+    saveTimelineBtn.BackgroundColor3 = Color3.fromRGB(50, 160, 100)
+    saveTimelineBtn.BackgroundTransparency = 0.3
+    saveTimelineBtn.BorderSizePixel = 0
+    saveTimelineBtn.Text = "💾 SIMPAN PERUBAHAN TIMELINE"
+    saveTimelineBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    saveTimelineBtn.Font = Enum.Font.GothamBold
+    saveTimelineBtn.TextSize = 11
+    saveTimelineBtn.ZIndex = 201
+    Instance.new("UICorner", saveTimelineBtn).CornerRadius = UDim.new(0, 6)
+    
+    saveTimelineBtn.MouseButton1Click:Connect(function()
+        SavedData[recordName] = editDataSession
+        Save()
+        RefreshLists()
+        Notify({Title="TIMELINE", Content="Perubahan timeline berhasil disimpan!", Color=Color3.fromRGB(50, 160, 100)})
+        pcall(function() timelineGui:Destroy() end)
+    end)
+    
+    closeTimelineBtn.MouseButton1Click:Connect(function()
+        pcall(function() timelineGui:Destroy() end)
+    end)
+end
+
+AddButtonUI(Tabs.Editor, "🛠 BUKA TIMELINE", function()
+    OpenTimelineEditor(EditSelect.Value)
+end)
+
 AddButtonUI(Tabs.Editor, "💾 SIMPAN PERUBAHAN", Save)
 
--- TAB 3: PLAYBACK (NOW PLAYING SELALU TAMPIL DI ATAS)
+-- TAB 3: PLAYBACK
 local NowPlayingContainer = Instance.new("Frame", Tabs.Surgery)
 NowPlayingContainer.Size = UDim2.new(1, -4, 0, 52)
 NowPlayingContainer.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
@@ -1326,131 +1717,604 @@ RefreshLists = function()
         end) 
         if RecSelect then RecSelect:SetValues(n) end
         if EditSelect then EditSelect:SetValues(n) end
-        if RefreshSettingDropdown then RefreshSettingDropdown() end
+        if RefreshBlacklistDisplay then RefreshBlacklistDisplay() end
     end
     UpdateQuickDropdownList(QuickSearchBox.Text)
 end
 
--- [ TAB 4: SETTING (PENGECUALIAN RANDOM DENGAN TOMBOL "LIST") ]
+-- TAB 4: SETTING
 AddSectionHeader(Tabs.Setting, "PENGATURAN RANDOM")
-SettingDropdown = AddSearchableDropdown(Tabs.Setting, "PILIH LAGU UNTUK DIKECUALIKAN", {})
 
-AddButtonUI(Tabs.Setting, "🚫 TAMBAH KE BLACKLIST", function()
-    local songToExclude = SettingDropdown.Value
-    if not songToExclude or songToExclude == "" then
-        Notify({Title="ERROR", Content="Pilih lagu terlebih dahulu!", Color=Color3.fromRGB(200, 50, 50)})
-        return
+local function OpenBlacklistDropdownPopup()
+    local popBg = Instance.new("Frame", ScreenGui)
+    popBg.Size = UDim2.fromScale(1, 1)
+    popBg.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    popBg.BackgroundTransparency = 0.6
+    popBg.BorderSizePixel = 0
+    popBg.ZIndex = 150
+    
+    local popBox = Instance.new("Frame", popBg)
+    popBox.Size = UDim2.fromOffset(280, 260)
+    popBox.Position = UDim2.new(0.5, -140, 0.5, -130)
+    popBox.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    popBox.BackgroundTransparency = 0.1
+    popBox.BorderSizePixel = 0
+    popBox.ZIndex = 151
+    Instance.new("UICorner", popBox).CornerRadius = UDim.new(0, 10)
+    
+    local pStroke = Instance.new("UIStroke", popBox)
+    pStroke.Color = Color3.fromRGB(255, 140, 0)
+    pStroke.Transparency = 0.3
+    pStroke.Thickness = 1.5
+    
+    local title = Instance.new("TextLabel", popBox)
+    title.Size = UDim2.new(1, -40, 0, 35)
+    title.Position = UDim2.new(0, 12, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "🚫 PILIH LAGU UNTUK BLACKLIST"
+    title.TextColor3 = Color3.fromRGB(255, 140, 0)
+    title.Font = Enum.Font.FredokaOne
+    title.TextSize = 10
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.ZIndex = 152
+    
+    local closePop = Instance.new("TextButton", popBox)
+    closePop.Size = UDim2.new(0, 26, 0, 26)
+    closePop.Position = UDim2.new(1, -32, 0, 5)
+    closePop.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    closePop.BackgroundTransparency = 0.2
+    closePop.BorderSizePixel = 0
+    closePop.Text = "×"
+    closePop.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closePop.Font = Enum.Font.FredokaOne
+    closePop.TextSize = 16
+    closePop.ZIndex = 152
+    Instance.new("UICorner", closePop).CornerRadius = UDim.new(0, 6)
+    
+    closePop.MouseButton1Click:Connect(function()
+        pcall(function() popBg:Destroy() end)
+    end)
+    
+    local searchBox = Instance.new("TextBox", popBox)
+    searchBox.Size = UDim2.new(1, -24, 0, 28)
+    searchBox.Position = UDim2.new(0, 12, 0, 40)
+    searchBox.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    searchBox.BackgroundTransparency = 0.2
+    searchBox.BorderSizePixel = 0
+    searchBox.Text = ""
+    searchBox.PlaceholderText = "Cari rekaman..."
+    searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    searchBox.PlaceholderColor3 = Color3.fromRGB(140, 140, 155)
+    searchBox.Font = Enum.Font.Gotham
+    searchBox.TextSize = 11
+    searchBox.ZIndex = 152
+    Instance.new("UICorner", searchBox).CornerRadius = UDim.new(0, 5)
+    
+    local scrollList = Instance.new("ScrollingFrame", popBox)
+    scrollList.Size = UDim2.new(1, -24, 1, -85)
+    scrollList.Position = UDim2.new(0, 12, 0, 76)
+    scrollList.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+    scrollList.BackgroundTransparency = 0.4
+    scrollList.BorderSizePixel = 0
+    scrollList.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scrollList.ScrollBarThickness = 3
+    scrollList.ZIndex = 152
+    Instance.new("UICorner", scrollList).CornerRadius = UDim.new(0, 6)
+    
+    local sLayout = Instance.new("UIListLayout", scrollList)
+    sLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    sLayout.Padding = UDim.new(0, 3)
+    
+    local function RenderPopupItems(query)
+        query = (query or ""):lower()
+        for _, c in pairs(scrollList:GetChildren()) do
+            if c:IsA("TextButton") then c:Destroy() end
+        end
+        
+        local allKeys = {}
+        if SavedData then
+            for k, _ in pairs(SavedData) do
+                if query == "" or k:lower():find(query) then
+                    table.insert(allKeys, k)
+                end
+            end
+        end
+        table.sort(allKeys, function(a, b) return a:lower() < b:lower() end)
+        
+        for _, songName in ipairs(allKeys) do
+            local itemBtn = Instance.new("TextButton", scrollList)
+            itemBtn.Size = UDim2.new(1, 0, 0, 28)
+            itemBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 34)
+            itemBtn.BackgroundTransparency = 0.3
+            itemBtn.BorderSizePixel = 0
+            itemBtn.Text = "  " .. songName
+            itemBtn.TextColor3 = Color3.fromRGB(245, 245, 250)
+            itemBtn.Font = Enum.Font.GothamMedium
+            itemBtn.TextSize = 10
+            itemBtn.TextXAlignment = Enum.TextXAlignment.Left
+            itemBtn.ZIndex = 153
+            Instance.new("UICorner", itemBtn).CornerRadius = UDim.new(0, 4)
+            
+            itemBtn.MouseButton1Click:Connect(function()
+                if not table.find(ExcludedRandomSongs, songName) then
+                    table.insert(ExcludedRandomSongs, songName)
+                    SaveSettings()
+                    Notify({Title="BLACKLIST", Content="Berhasil mengecualikan: " .. songName, Color=Color3.fromRGB(255, 140, 0)})
+                    if RefreshBlacklistDisplay then RefreshBlacklistDisplay() end
+                else
+                    Notify({Title="INFO", Content="Lagu sudah ada di daftar pengecualian.", Color=Color3.fromRGB(0, 170, 255)})
+                end
+                pcall(function() popBg:Destroy() end)
+            end)
+        end
+        scrollList.CanvasSize = UDim2.new(0, 0, 0, #allKeys * 31)
     end
     
-    if not table.find(ExcludedRandomSongs, songToExclude) then
-        table.insert(ExcludedRandomSongs, songToExclude)
-        SaveSettings()
-        Notify({Title="BLACKLIST", Content="Berhasil mengecualikan: " .. songToExclude, Color=Color3.fromRGB(255, 140, 0)})
-        if RefreshBlacklistDisplay then RefreshBlacklistDisplay() end
+    searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+        RenderPopupItems(searchBox.Text)
+    end)
+    
+    RenderPopupItems("")
+end
+
+local function OpenBlacklistListPopup()
+    local popBg = Instance.new("Frame", ScreenGui)
+    popBg.Size = UDim2.fromScale(1, 1)
+    popBg.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    popBg.BackgroundTransparency = 0.6
+    popBg.BorderSizePixel = 0
+    popBg.ZIndex = 150
+    
+    local popBox = Instance.new("Frame", popBg)
+    popBox.Size = UDim2.fromOffset(280, 260)
+    popBox.Position = UDim2.new(0.5, -140, 0.5, -130)
+    popBox.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    popBox.BackgroundTransparency = 0.1
+    popBox.BorderSizePixel = 0
+    popBox.ZIndex = 151
+    Instance.new("UICorner", popBox).CornerRadius = UDim.new(0, 10)
+    
+    local pStroke = Instance.new("UIStroke", popBox)
+    pStroke.Color = Color3.fromRGB(50, 160, 100)
+    pStroke.Transparency = 0.3
+    pStroke.Thickness = 1.5
+    
+    local title = Instance.new("TextLabel", popBox)
+    title.Size = UDim2.new(1, -40, 0, 35)
+    title.Position = UDim2.new(0, 12, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "📂 DAFTAR BLACKLIST"
+    title.TextColor3 = Color3.fromRGB(50, 160, 100)
+    title.Font = Enum.Font.FredokaOne
+    title.TextSize = 10
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.ZIndex = 152
+    
+    local closePop = Instance.new("TextButton", popBox)
+    closePop.Size = UDim2.new(0, 26, 0, 26)
+    closePop.Position = UDim2.new(1, -32, 0, 5)
+    closePop.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    closePop.BackgroundTransparency = 0.2
+    closePop.BorderSizePixel = 0
+    closePop.Text = "×"
+    closePop.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closePop.Font = Enum.Font.FredokaOne
+    closePop.TextSize = 16
+    closePop.ZIndex = 152
+    Instance.new("UICorner", closePop).CornerRadius = UDim.new(0, 6)
+    
+    closePop.MouseButton1Click:Connect(function()
+        pcall(function() popBg:Destroy() end)
+    end)
+    
+    local scrollList = Instance.new("ScrollingFrame", popBox)
+    scrollList.Size = UDim2.new(1, -24, 1, -50)
+    scrollList.Position = UDim2.new(0, 12, 0, 42)
+    scrollList.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+    scrollList.BackgroundTransparency = 0.4
+    scrollList.BorderSizePixel = 0
+    scrollList.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scrollList.ScrollBarThickness = 3
+    scrollList.ZIndex = 152
+    Instance.new("UICorner", scrollList).CornerRadius = UDim.new(0, 6)
+    
+    local sLayout = Instance.new("UIListLayout", scrollList)
+    sLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    sLayout.Padding = UDim.new(0, 3)
+    
+    local function RenderListItems()
+        for _, c in pairs(scrollList:GetChildren()) do
+            if c:IsA("Frame") then c:Destroy() end
+        end
+        
+        if #ExcludedRandomSongs == 0 then
+            local emptyLbl = Instance.new("TextLabel", scrollList)
+            emptyLbl.Size = UDim2.new(1, 0, 1, 0)
+            emptyLbl.BackgroundTransparency = 1
+            emptyLbl.Text = "(List Blacklist Kosong)"
+            emptyLbl.TextColor3 = Color3.fromRGB(150, 150, 165)
+            emptyLbl.Font = Enum.Font.GothamItalic
+            emptyLbl.TextSize = 10
+            emptyLbl.ZIndex = 153
+            return
+        end
+        
+        for _, songName in ipairs(ExcludedRandomSongs) do
+            local itemRow = Instance.new("Frame", scrollList)
+            itemRow.Size = UDim2.new(1, 0, 0, 28)
+            itemRow.BackgroundTransparency = 1
+            itemRow.ZIndex = 153
+            
+            local nameLbl = Instance.new("TextLabel", itemRow)
+            nameLbl.Size = UDim2.new(1, -35, 1, 0)
+            nameLbl.Position = UDim2.new(0, 6, 0, 0)
+            nameLbl.BackgroundTransparency = 1
+            nameLbl.Text = "- " .. songName
+            nameLbl.TextColor3 = Color3.fromRGB(255, 140, 140)
+            nameLbl.Font = Enum.Font.GothamMedium
+            nameLbl.TextSize = 10
+            nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+            nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+            nameLbl.ZIndex = 153
+            
+            local removeBtn = Instance.new("TextButton", itemRow)
+            removeBtn.Size = UDim2.new(0, 22, 0, 22)
+            removeBtn.Position = UDim2.new(1, -26, 0.5, -11)
+            removeBtn.BackgroundColor3 = Color3.fromRGB(180, 70, 70)
+            removeBtn.BackgroundTransparency = 0.3
+            removeBtn.BorderSizePixel = 0
+            removeBtn.Text = "×"
+            removeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            removeBtn.Font = Enum.Font.GothamBold
+            removeBtn.TextSize = 12
+            removeBtn.ZIndex = 153
+            Instance.new("UICorner", removeBtn).CornerRadius = UDim.new(0, 4)
+            
+            removeBtn.MouseButton1Click:Connect(function()
+                local idx = table.find(ExcludedRandomSongs, songName)
+                if idx then
+                    table.remove(ExcludedRandomSongs, idx)
+                    SaveSettings()
+                    RenderListItems()
+                    Notify({Title="BLACKLIST", Content="Dihapus dari list: " .. songName, Color=Color3.fromRGB(50, 160, 100)})
+                end
+            end)
+        end
+        scrollList.CanvasSize = UDim2.new(0, 0, 0, #ExcludedRandomSongs * 31)
+    end
+    
+    RenderListItems()
+end
+
+AddDualButtonUI(Tabs.Setting, "🚫 BLACKLIST", Color3.fromRGB(200, 120, 50), function()
+    OpenBlacklistDropdownPopup()
+end, "📂 LIST", Color3.fromRGB(50, 160, 100), function()
+    OpenBlacklistListPopup()
+end)
+
+-- PENGATURAN AFK & ANTI AFK
+AddSectionHeader(Tabs.Setting, "AFK & ANTI AFK")
+
+local AfkLoopThread = nil
+AddToggleUI(Tabs.Setting, "Tittle AFK", false, function(Value)
+    IsAfkActive = Value
+    local afkEvent = game:GetService("ReplicatedStorage"):FindFirstChild("AFKVisualState")
+    
+    if AfkLoopThread then
+        pcall(function() task.cancel(AfkLoopThread) end)
+        AfkLoopThread = nil
+    end
+    
+    if Value then
+        pcall(function()
+            if afkEvent and afkEvent:IsA("RemoteEvent") then
+                afkEvent:FireServer(true, 1)
+            end
+        end)
+        
+        AfkLoopThread = task.spawn(function()
+            while IsAfkActive do
+                task.wait(10)
+                pcall(function()
+                    if afkEvent and afkEvent:IsA("RemoteEvent") then
+                        afkEvent:FireServer(true, 1)
+                    end
+                end)
+            end
+        end)
+        
+        Notify({Title="AFK", Content="Tittle AFK Nyala", Color=Color3.fromRGB(50, 160, 100)})
     else
-        Notify({Title="INFO", Content="Lagu sudah ada di daftar pengecualian.", Color=Color3.fromRGB(0, 170, 255)})
+        pcall(function()
+            if afkEvent and afkEvent:IsA("RemoteEvent") then
+                afkEvent:FireServer(false, -1)
+            end
+        end)
+        Notify({Title="AFK", Content="AFK dimatikan", Color=Color3.fromRGB(200, 50, 50)})
     end
 end)
 
-local ViewListBtn = AddButtonUI(Tabs.Setting, "📂 LIST (BUKA DAFTAR BLACKLIST)", function() end)
+AddToggleUI(Tabs.Setting, "ANTI-AFK", true, function(Value)
+    IsAntiAfkActive = Value
+    if not Value then
+        if AntiAfkConnection then pcall(function() AntiAfkConnection:Disconnect() end) end
+        if AntiAfkTimerThread then pcall(function() task.cancel(AntiAfkTimerThread) end) end
+        Notify({Title="ANTI-AFK", Content="Anti-AFK dimatikan", Color=Color3.fromRGB(200, 50, 50)})
+    else
+        Notify({Title="ANTI-AFK", Content="Anti-AFK aktif (interval 5m)", Color=Color3.fromRGB(50, 160, 100)})
+    end
+end)
 
-local BlacklistContainer = Instance.new("ScrollingFrame", Tabs.Setting)
-BlacklistContainer.Size = UDim2.new(1, -4, 0, 110)
-BlacklistContainer.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
-BlacklistContainer.BackgroundTransparency = 0.4
-BlacklistContainer.BorderSizePixel = 0
-BlacklistContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
-BlacklistContainer.ScrollBarThickness = 3
-BlacklistContainer.Visible = false
-Instance.new("UICorner", BlacklistContainer).CornerRadius = UDim.new(0, 7)
+-- FITUR REJOIN / RE (POP-UP UI KECIL 1x1 YANG DAPAT DIDRAG)
+AddSectionHeader(Tabs.Setting, "REJOIN / RE")
 
-local BlacklistLayout = Instance.new("UIListLayout", BlacklistContainer)
-BlacklistLayout.SortOrder = Enum.SortOrder.LayoutOrder
-BlacklistLayout.Padding = UDim.new(0, 3)
+local function OpenSmallRejoinPopup()
+    local smallGui = Instance.new("Frame", ScreenGui)
+    smallGui.Size = UDim2.fromOffset(130, 95)
+    smallGui.Position = UDim2.new(0.5, -65, 0.5, -47)
+    smallGui.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+    smallGui.BackgroundTransparency = 0.2
+    smallGui.BorderSizePixel = 0
+    smallGui.ZIndex = 180
+    Instance.new("UICorner", smallGui).CornerRadius = UDim.new(0, 8)
+    
+    local smallStroke = Instance.new("UIStroke", smallGui)
+    smallStroke.Color = Color3.fromRGB(0, 170, 255)
+    smallStroke.Transparency = 0.3
+    smallStroke.Thickness = 1.5
+    
+    local smallTop = Instance.new("Frame", smallGui)
+    smallTop.Size = UDim2.new(1, 0, 0, 24)
+    smallTop.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+    smallTop.BackgroundTransparency = 0.3
+    smallTop.BorderSizePixel = 0
+    smallTop.ZIndex = 181
+    Instance.new("UICorner", smallTop).CornerRadius = UDim.new(0, 8)
+    
+    local smallTitle = Instance.new("TextLabel", smallTop)
+    smallTitle.Size = UDim2.new(1, -26, 1, 0)
+    smallTitle.Position = UDim2.new(0, 6, 0, 0)
+    smallTitle.BackgroundTransparency = 1
+    smallTitle.Text = "⚙ RE / REJOIN"
+    smallTitle.TextColor3 = Color3.fromRGB(0, 170, 255)
+    smallTitle.Font = Enum.Font.FredokaOne
+    smallTitle.TextSize = 9
+    smallTitle.TextXAlignment = Enum.TextXAlignment.Left
+    smallTitle.ZIndex = 182
+    
+    local closeSmall = Instance.new("TextButton", smallTop)
+    closeSmall.Size = UDim2.new(0, 20, 0, 20)
+    closeSmall.Position = UDim2.new(1, -22, 0.5, -10)
+    closeSmall.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    closeSmall.BackgroundTransparency = 0.2
+    closeSmall.BorderSizePixel = 0
+    closeSmall.Text = "×"
+    closeSmall.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeSmall.Font = Enum.Font.FredokaOne
+    closeSmall.TextSize = 12
+    closeSmall.ZIndex = 182
+    Instance.new("UICorner", closeSmall).CornerRadius = UDim.new(0, 4)
+    
+    closeSmall.MouseButton1Click:Connect(function()
+        pcall(function() smallGui:Destroy() end)
+    end)
+    
+    local btnRejoin = Instance.new("TextButton", smallGui)
+    btnRejoin.Size = UDim2.new(1, -12, 0, 28)
+    btnRejoin.Position = UDim2.new(0, 6, 0, 30)
+    btnRejoin.BackgroundColor3 = Color3.fromRGB(200, 70, 70)
+    btnRejoin.BackgroundTransparency = 0.3
+    btnRejoin.BorderSizePixel = 0
+    btnRejoin.Text = "🔄 REJOIN"
+    btnRejoin.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btnRejoin.Font = Enum.Font.GothamBold
+    btnRejoin.TextSize = 10
+    btnRejoin.ZIndex = 181
+    Instance.new("UICorner", btnRejoin).CornerRadius = UDim.new(0, 5)
+    
+    btnRejoin.MouseButton1Click:Connect(function()
+        pcall(function()
+            local rEvent = game:GetService("ReplicatedStorage"):FindFirstChild("AFKRejoin")
+            if rEvent and rEvent:IsA("RemoteEvent") then
+                rEvent:FireServer()
+            else
+                TeleportService:Teleport(game.PlaceId, player)
+            end
+        end)
+    end)
+    
+    local btnRefresh = Instance.new("TextButton", smallGui)
+    btnRefresh.Size = UDim2.new(1, -12, 0, 28)
+    btnRefresh.Position = UDim2.new(0, 6, 0, 61)
+    btnRefresh.BackgroundColor3 = Color3.fromRGB(50, 160, 100)
+    btnRefresh.BackgroundTransparency = 0.3
+    btnRefresh.BorderSizePixel = 0
+    btnRefresh.Text = "✨ GANTI AVA / RE"
+    btnRefresh.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btnRefresh.Font = Enum.Font.GothamBold
+    btnRefresh.TextSize = 10
+    btnRefresh.ZIndex = 181
+    Instance.new("UICorner", btnRefresh).CornerRadius = UDim.new(0, 5)
+    
+    btnRefresh.MouseButton1Click:Connect(function()
+        pcall(function()
+            local remotesFolder = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+            local refEvent = remotesFolder and remotesFolder:FindFirstChild("RefreshCharacterEvent")
+            if refEvent and refEvent:IsA("RemoteEvent") then
+                refEvent:FireServer()
+                Notify({Title="REFRESH", Content="Ganti ava / refresh dikirim!", Color=Color3.fromRGB(50, 160, 100)})
+            else
+                Notify({Title="ERROR", Content="Event RefreshCharacterEvent tidak ditemukan!", Color=Color3.fromRGB(200, 50, 50)})
+            end
+        end)
+    end)
+    
+    MakeDraggable(smallGui, smallTop)
+end
 
-RefreshBlacklistDisplay = function()
-    for _, c in pairs(BlacklistContainer:GetChildren()) do
-        if c:IsA("Frame") or c:IsA("TextLabel") then c:Destroy() end
+AddButtonUI(Tabs.Setting, "⚙ BUKA POP-UP REJOIN / RE", function()
+    OpenSmallRejoinPopup()
+end)
+
+-- [ TAB 5: PLAYER & INDIVIDUAL ESP HIGHLIGHT ]
+AddSectionHeader(Tabs.Player, "DAFTAR PLAYER DI SERVER")
+
+local PlayerSearchInput = AddInputUI(Tabs.Player, "CARI PLAYER", "", "Ketik nama player...")
+local PlayerListScroll = Instance.new("ScrollingFrame", Tabs.Player)
+PlayerListScroll.Size = UDim2.new(1, -4, 0, 230)
+PlayerListScroll.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
+PlayerListScroll.BackgroundTransparency = 0.4
+PlayerListScroll.BorderSizePixel = 0
+PlayerListScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+PlayerListScroll.ScrollBarThickness = 3
+Instance.new("UICorner", PlayerListScroll).CornerRadius = UDim.new(0, 7)
+
+local PlayerListLayout = Instance.new("UIListLayout", PlayerListScroll)
+PlayerListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+PlayerListLayout.Padding = UDim.new(0, 4)
+
+RefreshPlayerList = function()
+    for _, c in pairs(PlayerListScroll:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
     end
     
-    if #ExcludedRandomSongs == 0 then
-        local emptyLbl = Instance.new("TextLabel", BlacklistContainer)
-        emptyLbl.Size = UDim2.new(1, 0, 1, 0)
-        emptyLbl.BackgroundTransparency = 1
-        emptyLbl.Text = "(List Blacklist Kosong)"
-        emptyLbl.TextColor3 = Color3.fromRGB(150, 150, 165)
-        emptyLbl.Font = Enum.Font.GothamItalic
-        emptyLbl.TextSize = 10
-        return
+    local query = (PlayerSearchInput.Value or ""):lower()
+    local count = 0
+    
+    local friendsList = {}
+    local othersList = {}
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            local pName = p.Name
+            local pDisplayName = p.DisplayName
+            
+            if query == "" or pName:lower():find(query) or pDisplayName:lower():find(query) then
+                local isFriend = false
+                pcall(function()
+                    isFriend = player:IsFriendsWith(p.UserId)
+                end)
+                
+                local playerData = {Player = p, Name = pName, DisplayName = pDisplayName, IsFriend = isFriend}
+                if isFriend then
+                    table.insert(friendsList, playerData)
+                else
+                    table.insert(othersList, playerData)
+                end
+            end
+        end
     end
     
-    for i, songName in ipairs(ExcludedRandomSongs) do
-        local itemRow = Instance.new("Frame", BlacklistContainer)
-        itemRow.Size = UDim2.new(1, 0, 0, 26)
-        itemRow.BackgroundTransparency = 1
+    -- Urutkan berdasarkan Display Name secara abjad
+    table.sort(friendsList, function(a, b) return a.DisplayName:lower() < b.DisplayName:lower() end)
+    table.sort(othersList, function(a, b) return a.DisplayName:lower() < b.DisplayName:lower() end)
+    
+    local combinedList = {}
+    for _, data in ipairs(friendsList) do table.insert(combinedList, data) end
+    for _, data in ipairs(othersList) do table.insert(combinedList, data) end
+    
+    for _, data in ipairs(combinedList) do
+        local p = data.Player
+        local pName = data.Name
+        local pDisplayName = data.DisplayName
+        local isFriend = data.IsFriend
         
-        local nameLbl = Instance.new("TextLabel", itemRow)
-        nameLbl.Size = UDim2.new(1, -35, 1, 0)
+        count = count + 1
+        
+        local row = Instance.new("Frame", PlayerListScroll)
+        row.Size = UDim2.new(1, 0, 0, 36)
+        row.BackgroundColor3 = isFriend and Color3.fromRGB(30, 40, 50) or Color3.fromRGB(22, 22, 28)
+        row.BackgroundTransparency = 0.3
+        row.BorderSizePixel = 0
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
+        
+        local nameLbl = Instance.new("TextLabel", row)
+        nameLbl.Size = UDim2.new(0.42, 0, 1, 0)
         nameLbl.Position = UDim2.new(0, 6, 0, 0)
         nameLbl.BackgroundTransparency = 1
-        nameLbl.Text = "- " .. songName
-        nameLbl.TextColor3 = Color3.fromRGB(255, 140, 140)
+        nameLbl.Text = string.format("%s%s\n<font color='#9090a5'>@%s</font>", isFriend and "⭐ " or "", pDisplayName, pName)
+        nameLbl.RichText = true
+        nameLbl.TextColor3 = isFriend and Color3.fromRGB(0, 255, 170) or Color3.fromRGB(245, 245, 250)
         nameLbl.Font = Enum.Font.GothamMedium
         nameLbl.TextSize = 10
         nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+        nameLbl.TextYAlignment = Enum.TextYAlignment.Center
         nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
         
-        local removeBtn = Instance.new("TextButton", itemRow)
-        removeBtn.Size = UDim2.new(0, 22, 0, 22)
-        removeBtn.Position = UDim2.new(1, -26, 0.5, -11)
-        removeBtn.BackgroundColor3 = Color3.fromRGB(180, 70, 70)
-        removeBtn.BackgroundTransparency = 0.3
-        removeBtn.BorderSizePixel = 0
-        removeBtn.Text = "×"
-        removeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        removeBtn.Font = Enum.Font.GothamBold
-        removeBtn.TextSize = 12
-        Instance.new("UICorner", removeBtn).CornerRadius = UDim.new(0, 4)
+        -- Tombol ESP Individual (Per Player)
+        local espBtn = Instance.new("TextButton", row)
+        espBtn.Size = UDim2.new(0, 45, 0, 22)
+        espBtn.Position = UDim2.new(1, -126, 0.5, -11)
+        espBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 85)
+        espBtn.BackgroundTransparency = 0.3
+        espBtn.BorderSizePixel = 0
+        espBtn.Text = "ESP"
+        espBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        espBtn.Font = Enum.Font.GothamBold
+        espBtn.TextSize = 9
+        Instance.new("UICorner", espBtn).CornerRadius = UDim.new(0, 4)
         
-        removeBtn.MouseButton1Click:Connect(function()
-            local idx = table.find(ExcludedRandomSongs, songName)
-            if idx then
-                table.remove(ExcludedRandomSongs, idx)
-                SaveSettings()
-                RefreshBlacklistDisplay()
-                Notify({Title="BLACKLIST", Content="Dihapus dari list: " .. songName, Color=Color3.fromRGB(50, 160, 100)})
-            end
+        local isEspActive = false
+        espBtn.MouseButton1Click:Connect(function()
+            isEspActive = not isEspActive
+            espBtn.BackgroundColor3 = isEspActive and Color3.fromRGB(50, 160, 100) or Color3.fromRGB(70, 70, 85)
+            
+            pcall(function()
+                if isEspActive then
+                    if p.Character and not p.Character:FindFirstChild("AutoLeadEspHighlight") then
+                        local hl = Instance.new("Highlight")
+                        hl.Name = "AutoLeadEspHighlight"
+                        hl.Adornee = p.Character
+                        hl.FillTransparency = 1
+                        hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                        hl.OutlineTransparency = 0
+                        hl.Parent = p.Character
+                    end
+                else
+                    if p.Character and p.Character:FindFirstChild("AutoLeadEspHighlight") then
+                        p.Character.AutoLeadEspHighlight:Destroy()
+                    end
+                end
+            end)
+        end)
+        
+        -- Tombol Teleport ke Player
+        local tpBtn = Instance.new("TextButton", row)
+        tpBtn.Size = UDim2.new(0, 70, 0, 22)
+        tpBtn.Position = UDim2.new(1, -76, 0.5, -11)
+        tpBtn.BackgroundColor3 = Color3.fromRGB(50, 160, 100)
+        tpBtn.BackgroundTransparency = 0.3
+        tpBtn.BorderSizePixel = 0
+        tpBtn.Text = "📍 TP"
+        tpBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        tpBtn.Font = Enum.Font.GothamBold
+        tpBtn.TextSize = 9
+        Instance.new("UICorner", tpBtn).CornerRadius = UDim.new(0, 4)
+        
+        tpBtn.MouseButton1Click:Connect(function()
+            pcall(function()
+                if p.Character and p.Character:FindFirstChild("HumanoidRootPart") and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+                    player.Character.HumanoidRootPart.CFrame = p.Character.HumanoidRootPart.CFrame + Vector3.new(0, 3, 0)
+                    Notify({Title="TELEPORT", Content="Berteleportasi ke: " .. p.Name, Color=Color3.fromRGB(50, 160, 100)})
+                end
+            end)
         end)
     end
     
-    BlacklistContainer.CanvasSize = UDim2.new(0, 0, 0, #ExcludedRandomSongs * 29)
+    PlayerListScroll.CanvasSize = UDim2.new(0, 0, 0, count * 40)
 end
 
-ViewListBtn.MouseButton1Click:Connect(function()
-    BlacklistContainer.Visible = not BlacklistContainer.Visible
-    if BlacklistContainer.Visible then
-        ViewListBtn.Text = "📂 LIST (TUTUP DAFTAR BLACKLIST)"
-        RefreshBlacklistDisplay()
-    else
-        ViewListBtn.Text = "📂 LIST (BUKA DAFTAR BLACKLIST)"
-    end
+PlayerSearchInput.Box:GetPropertyChangedSignal("Text"):Connect(function()
+    RefreshPlayerList()
 end)
 
-RefreshSettingDropdown = function()
-    local allKeys = {}
-    if SavedData then
-        for k, _ in pairs(SavedData) do table.insert(allKeys, k) end
-    end
-    if SettingDropdown then SettingDropdown:SetValues(allKeys) end
-    RefreshBlacklistDisplay()
-end
+Players.PlayerAdded:Connect(RefreshPlayerList)
+Players.PlayerRemoving:Connect(RefreshPlayerList)
 
-
--- PROTOCOL ENGINE & GLOBAL CLEANUP
+-- [ PROTOCOL ENGINE & GLOBAL CLEANUP ]
 GlobalStop = function()
     IsPlayingPlayback = false
     IsRecording = false
-    IsFromRandomLoop = false
     
     if CurrentPlaybackThread then 
         pcall(function() task.cancel(CurrentPlaybackThread) end)
@@ -1479,10 +2343,27 @@ end
 
 getgenv().AutoLeadCleanup = function()
     GlobalStop()
+    
+    pcall(function()
+        local Event = game:GetService("ReplicatedStorage"):FindFirstChild("AFKVisualState")
+        if Event and Event:IsA("RemoteEvent") then
+            Event:FireServer(false, -1)
+        end
+    end)
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character and p.Character:FindFirstChild("AutoLeadEspHighlight") then
+            p.Character.AutoLeadEspHighlight:Destroy()
+        end
+    end
+    
+    IsAfkActive = false
+    if AfkLoopThread then pcall(function() task.cancel(AfkLoopThread) end) end
     if CharacterConnection then pcall(function() CharacterConnection:Disconnect() end) end
     if RemoteConnection then pcall(function() RemoteConnection:Disconnect() end) end
     if AutoRecordConnection then pcall(function() AutoRecordConnection:Disconnect() end) end
     if AntiAfkConnection then pcall(function() AntiAfkConnection:Disconnect() end) end
+    if AntiAfkTimerThread then pcall(function() task.cancel(AntiAfkTimerThread) end) end
     if ScreenGui then pcall(function() ScreenGui:Destroy() end) end
     getgenv().AutoLeadCleanup = nil
 end
@@ -1495,8 +2376,12 @@ local function SetupRecorder()
         if not IsRecording then return end
         if track.Priority == Enum.AnimationPriority.Core then return end
         
+        local animId = track.Animation.AnimationId
+        -- Abaikan jika animasi masuk daftar blacklist
+        if IsAnimationIgnored(animId) then return end
+        
         table.insert(TempSession, {
-            id = track.Animation.AnimationId, 
+            id = animId, 
             time = tick() - StartTime, 
             speed = track.Speed,
             isNewAnim = true 
@@ -1508,7 +2393,7 @@ local function SetupRecorder()
                 if math.abs(track.Speed - lastRecordedSpeed) > 0.01 then
                     lastRecordedSpeed = track.Speed
                     table.insert(TempSession, {
-                        id = track.Animation.AnimationId, 
+                        id = animId, 
                         time = tick() - StartTime, 
                         speed = track.Speed, 
                         isSpeedUpdateOnly = true 
@@ -1541,10 +2426,17 @@ local function GetValidRandomKey()
     return nil
 end
 
-RunPlayback = function(targetName, isRandomLoop, seekSeconds)
+RunPlayback = function(targetName, seekSeconds)
     if not targetName or not SavedData[targetName] then 
         targetName = GetValidRandomKey()
-        if not targetName then return end
+        if not targetName then 
+            Notify({
+                Title = "RANDOM ERROR", 
+                Content = "Gagal memutar random: List kosong / semua di-blacklist!", 
+                Color = Color3.fromRGB(200, 50, 50)
+            })
+            return 
+        end
     end
     
     IsPlayingPlayback = false
@@ -1555,7 +2447,6 @@ RunPlayback = function(targetName, isRandomLoop, seekSeconds)
     task.wait(0.05) 
     
     IsPlayingPlayback = true
-    IsFromRandomLoop = isRandomLoop or false
     
     CurrentPlaybackThread = task.spawn(function()
         local rawDataList = SavedData[targetName] 
@@ -1572,26 +2463,29 @@ RunPlayback = function(targetName, isRandomLoop, seekSeconds)
 
         for _, entry in ipairs(rawDataList) do
             if entry and type(entry) == "table" and entry.id then
-                local newEntry = { 
-                    id = entry.id, 
-                    time = tonumber(entry.time) or 0, 
-                    speed = tonumber(entry.speed) or 1 
-                }
-                
-                if entry.isNewAnim ~= nil or entry.isSpeedUpdateOnly ~= nil then
-                    newEntry.isNewAnim = entry.isNewAnim
-                    newEntry.isSpeedUpdateOnly = entry.isSpeedUpdateOnly
-                else
-                    if entry.id == lastId and lastId ~= "" then
-                        newEntry.isNewAnim = false
-                        newEntry.isSpeedUpdateOnly = true
+                -- Lewati animasi yang masuk dalam daftar blacklist saat playback
+                if not IsAnimationIgnored(entry.id) then
+                    local newEntry = { 
+                        id = entry.id, 
+                        time = tonumber(entry.time) or 0, 
+                        speed = tonumber(entry.speed) or 1 
+                    }
+                    
+                    if entry.isNewAnim ~= nil or entry.isSpeedUpdateOnly ~= nil then
+                        newEntry.isNewAnim = entry.isNewAnim
+                        newEntry.isSpeedUpdateOnly = entry.isSpeedUpdateOnly
                     else
-                        newEntry.isNewAnim = true
-                        newEntry.isSpeedUpdateOnly = false
+                        if entry.id == lastId and lastId ~= "" then
+                            newEntry.isNewAnim = false
+                            newEntry.isSpeedUpdateOnly = true
+                        else
+                            newEntry.isNewAnim = true
+                            newEntry.isSpeedUpdateOnly = false
+                        end
                     end
+                    lastId = newEntry.id
+                    table.insert(processedData, newEntry)
                 end
-                lastId = newEntry.id
-                table.insert(processedData, newEntry)
             end
         end
 
@@ -1669,17 +2563,23 @@ RunPlayback = function(targetName, isRandomLoop, seekSeconds)
         if IsAutoRemotePlayEnabled and not IsPlayingPlayback and not IsRecording then
             Notify({
                 Title = "AUTO PLAY", 
-                Content = "Rekaman selesai. Jeda 3 detik...", 
+                Content = "Rekaman habis. Menunggu 3 detik ke random...", 
                 Color = Color3.fromRGB(255, 140, 0)
             })
             
-            task.wait(3)
+            task.wait(3.0)
             
             if IsAutoRemotePlayEnabled and not IsPlayingPlayback and not IsRecording then
                 local randomKey = GetValidRandomKey()
                 if randomKey then
                     Notify({Title="AUTO PLAY", Content="Lanjut Random: " .. randomKey, Color=Color3.fromRGB(255, 140, 0)})
-                    RunPlayback(randomKey, true, 0)
+                    RunPlayback(randomKey, 0)
+                else
+                    Notify({
+                        Title = "AUTO PLAY ERROR", 
+                        Content = "Tidak ada lagu valid untuk random!", 
+                        Color = Color3.fromRGB(200, 50, 50)
+                    })
                 end
             end
         end
@@ -1704,7 +2604,7 @@ SeekGoBtn.MouseButton1Click:Connect(function()
     end
     
     if actualKey and SavedData[actualKey] then
-        RunPlayback(actualKey, false, seekSeconds)
+        RunPlayback(actualKey, seekSeconds)
         Notify({Title="SEEK", Content=string.format("Melompat ke: %.1fs", seekSeconds), Color=Color3.fromRGB(50, 160, 100)})
     else
         Notify({Title="ERROR", Content="Data rekaman tidak ditemukan!", Color=Color3.fromRGB(200, 50, 50)})
@@ -1712,7 +2612,7 @@ SeekGoBtn.MouseButton1Click:Connect(function()
 end)
 
 AddDualButtonUI(Tabs.Surgery, "▶ START PLAYBACK", Color3.fromRGB(50, 160, 100), function()
-    RunPlayback(RecSelect.Value, false, 0)
+    RunPlayback(RecSelect.Value, 0)
 end, "⏹ STOP", Color3.fromRGB(180, 70, 70), function()
     GlobalStop()
     Notify({Title="SYSTEM", Content="Playback dihentikan", Duration = 2.0})
@@ -1754,22 +2654,24 @@ AddToggleUI(Tabs.Surgery, "AUTO PLAY VIA REMOTE", false, function(Value)
                     
                     if rawName == "" or rawName == "nil" then return end
                     
-                    local remoteNameClean = string.lower(string.gsub(rawName, "[%s%-_%p]", ""))
+                    local cleanedSongName = CleanSongName(rawName)
+                    if cleanedSongName == "" then return end
                     
+                    local remoteClean = CleanAndNormalize(cleanedSongName)
                     local exactMatchKey = nil
-                    local matchedKeys = {}
+                    local partialMatchKey = nil
                     
                     for k, _ in pairs(SavedData) do
-                        local savedKeyClean = string.lower(string.gsub(k, "[%s%-_%p]", ""))
-                        if savedKeyClean == remoteNameClean then
+                        local savedClean = CleanAndNormalize(k)
+                        if savedClean == remoteClean then
                             exactMatchKey = k
                             break
-                        elseif string.find(remoteNameClean, savedKeyClean, 1, true) or string.find(savedKeyClean, remoteNameClean, 1, true) then
-                            table.insert(matchedKeys, k)
+                        elseif not partialMatchKey and (savedClean:find(remoteClean, 1, true) or remoteClean:find(savedClean, 1, true)) then
+                            partialMatchKey = k
                         end
                     end
                     
-                    local chosenKey = exactMatchKey or matchedKeys[1]
+                    local chosenKey = exactMatchKey or partialMatchKey
                     
                     if chosenKey then
                         Notify({
@@ -1777,20 +2679,28 @@ AddToggleUI(Tabs.Surgery, "AUTO PLAY VIA REMOTE", false, function(Value)
                             Content = "Memutar rekaman: " .. chosenKey, 
                             Color = Color3.fromRGB(50, 160, 100)
                         })
-                        RunPlayback(chosenKey, false, 0)
+                        RunPlayback(chosenKey, 0)
                     else
+                        Notify({
+                            Title = "LAGU TIDAK ADA", 
+                            Content = "Nama tidak cocok, memutar random dari awal!", 
+                            Color = Color3.fromRGB(255, 140, 0)
+                        })
+                        
+                        task.wait(0.3)
+                        
                         local randomKey = GetValidRandomKey()
                         if randomKey then
                             Notify({
-                                Title = "AUTO PLAY", 
-                                Content = "Rekaman tidak ada! Random: " .. randomKey, 
-                                Color = Color3.fromRGB(255, 140, 0)
+                                Title = "RANDOM", 
+                                Content = "Memutar dari awal: " .. randomKey, 
+                                Color = Color3.fromRGB(0, 170, 255)
                             })
-                            RunPlayback(randomKey, true, 0)
+                            RunPlayback(randomKey, 0)
                         else
                             Notify({
-                                Title = "AUTO PLAY", 
-                                Content = "List rekaman kosong / semua di-blacklist!", 
+                                Title = "RANDOM ERROR", 
+                                Content = "List kosong / semua di-blacklist!", 
                                 Color = Color3.fromRGB(200, 50, 50)
                             })
                         end
@@ -1810,7 +2720,6 @@ AddToggleUI(Tabs.Surgery, "MUNCULKAN FLOATING PLAYBACK UI", false, function(Valu
     QuickFrame.Visible = Value
 end)
 
--- [ DIALOG KONFIRMASI & TOMBOL HAPUS REKAMAN ]
 local function ShowConfirmDialog(recordName, onConfirm)
     local dialogBg = Instance.new("Frame", ScreenGui)
     dialogBg.Size = UDim2.fromScale(1, 1)
@@ -1869,6 +2778,11 @@ local function ShowConfirmDialog(recordName, onConfirm)
     yesBtn.ZIndex = 152
     Instance.new("UICorner", yesBtn).CornerRadius = UDim.new(0, 6)
     
+    yesBtn.MouseButton1Click:Connect(function()
+        pcall(function() dialogBg:Destroy() end)
+        if onConfirm then onConfirm() end
+    end)
+    
     local noBtn = Instance.new("TextButton", dialogBox)
     noBtn.Size = UDim2.new(0.45, 0, 0, 28)
     noBtn.Position = UDim2.new(0.5, 0, 1, -38)
@@ -1882,17 +2796,12 @@ local function ShowConfirmDialog(recordName, onConfirm)
     noBtn.ZIndex = 152
     Instance.new("UICorner", noBtn).CornerRadius = UDim.new(0, 6)
     
-    yesBtn.MouseButton1Click:Connect(function()
-        pcall(function() dialogBg:Destroy() end)
-        if onConfirm then onConfirm() end
-    end)
-    
     noBtn.MouseButton1Click:Connect(function()
         pcall(function() dialogBg:Destroy() end)
     end)
 end
 
-AddButtonUI(Tabs.Surgery, "🗑️ HAPUS REKAMAN (PERMANEN)", function()
+AddButtonUI(Tabs.Surgery, "🗑 HAPUS REKAMAN (PERMANEN)", function()
     local selectedName = RecSelect.Value
     if not selectedName or selectedName == "" or not SavedData[selectedName] then
         Notify({Title="ERROR", Content="Tidak ada rekaman yang dipilih.", Color=Color3.fromRGB(200, 50, 50)})
@@ -1907,8 +2816,9 @@ AddButtonUI(Tabs.Surgery, "🗑️ HAPUS REKAMAN (PERMANEN)", function()
     end)
 end)
 
--- [ 4. FITUR ANTI-AFK OTOMATIS (Setiap 18 Menit) ]
+-- [ 4. FITUR ANTI-AFK & INISIALISASI ]
 AntiAfkConnection = player.Idled:Connect(function()
+    if not IsAntiAfkActive then return end
     pcall(function()
         VirtualUser:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
         task.wait(1)
@@ -1916,34 +2826,41 @@ AntiAfkConnection = player.Idled:Connect(function()
     end)
 end)
 
-task.spawn(function()
+AntiAfkTimerThread = task.spawn(function()
     while true do
-        task.wait(1080)
-        pcall(function()
-            VirtualUser:Button1Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
-            task.wait(0.5)
-            VirtualUser:Button1Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
-            Notify({
-                Title = "ANTI-AFK", 
-                Content = "Aktivitas anti-AFK dijalankan (18m).", 
-                Color = Color3.fromRGB(0, 170, 255)
-            })
-        end)
+        task.wait(300)
+        if IsAntiAfkActive then
+            pcall(function()
+                local cam = workspace.CurrentCamera
+                if cam then
+                    cam.CFrame = cam.CFrame * CFrame.Angles(0, math.rad(1), 0)
+                    task.wait(0.1)
+                    cam.CFrame = cam.CFrame * CFrame.Angles(0, math.rad(-1), 0)
+                end
+                
+                Notify({
+                    Title = "ANTI-AFK", 
+                    Content = "Anti-AFK aktif (interval 5 menit).", 
+                    Color = Color3.fromRGB(0, 170, 255)
+                })
+            end)
+        end
     end
 end)
 
 QuickPlayBtn.MouseButton1Click:Connect(function()
     if QuickSelectedValue ~= "" and SavedData[QuickSelectedValue] then
-        RunPlayback(QuickSelectedValue, false, 0)
+        RunPlayback(QuickSelectedValue, 0)
         Notify({Title="QUICK PLAY", Content="Memutar: " .. QuickSelectedValue, Color=Color3.fromRGB(50, 160, 100)})
     else
         Notify({Title="ERROR", Content="Pilih rekaman di list pop-up dulu!", Color=Color3.fromRGB(200, 50, 50)})
     end
 end)
 
-QuickStopBtn.MouseButton1Click:Connect(function()
+QuickStopBtn.MouseButton1Click:Connect(function2_or_globalstop or function()
     GlobalStop()
-    Notify({Title="QUICK STOP", Content="Playback dihentikan", Color=Color3.fromRGB(200, 50, 50)})
+    Notify({Title="QUICK STOP", Content="Playback dihentikan", Color=Color3.fromRGB(180, 70, 70)})
 end)
 
 RefreshLists()
+RefreshPlayerList()
