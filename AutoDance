@@ -31,7 +31,6 @@ local function IsAnimationIgnored(animId)
     if not animId then return false end
     local cleanId = tostring(animId)
     if IgnoredAnimationIds[cleanId] then return true end
-    -- Cek jika formatnya mengandung angka murni
     local pureNum = cleanId:match("%d+")
     if pureNum and IgnoredAnimationIds[pureNum] then return true end
     return false
@@ -2205,7 +2204,6 @@ RefreshPlayerList = function()
         end
     end
     
-    -- Urutkan berdasarkan Display Name secara abjad
     table.sort(friendsList, function(a, b) return a.DisplayName:lower() < b.DisplayName:lower() end)
     table.sort(othersList, function(a, b) return a.DisplayName:lower() < b.DisplayName:lower() end)
     
@@ -2241,7 +2239,6 @@ RefreshPlayerList = function()
         nameLbl.TextYAlignment = Enum.TextYAlignment.Center
         nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
         
-        -- Tombol ESP Individual (Per Player)
         local espBtn = Instance.new("TextButton", row)
         espBtn.Size = UDim2.new(0, 45, 0, 22)
         espBtn.Position = UDim2.new(1, -126, 0.5, -11)
@@ -2278,7 +2275,6 @@ RefreshPlayerList = function()
             end)
         end)
         
-        -- Tombol Teleport ke Player
         local tpBtn = Instance.new("TextButton", row)
         tpBtn.Size = UDim2.new(0, 70, 0, 22)
         tpBtn.Position = UDim2.new(1, -76, 0.5, -11)
@@ -2377,7 +2373,6 @@ local function SetupRecorder()
         if track.Priority == Enum.AnimationPriority.Core then return end
         
         local animId = track.Animation.AnimationId
-        -- Abaikan jika animasi masuk daftar blacklist
         if IsAnimationIgnored(animId) then return end
         
         table.insert(TempSession, {
@@ -2463,7 +2458,6 @@ RunPlayback = function(targetName, seekSeconds)
 
         for _, entry in ipairs(rawDataList) do
             if entry and type(entry) == "table" and entry.id then
-                -- Lewati animasi yang masuk dalam daftar blacklist saat playback
                 if not IsAnimationIgnored(entry.id) then
                     local newEntry = { 
                         id = entry.id, 
@@ -2658,25 +2652,31 @@ AddToggleUI(Tabs.Surgery, "AUTO PLAY VIA REMOTE", false, function(Value)
                     if cleanedSongName == "" then return end
                     
                     local remoteClean = CleanAndNormalize(cleanedSongName)
-                    local exactMatchKey = nil
-                    local partialMatchKey = nil
+                    
+                    -- Kumpulkan semua key yang cocok ke dalam satu kelompok (family) untuk diacak
+                    local matchedGroup = {}
                     
                     for k, _ in pairs(SavedData) do
                         local savedClean = CleanAndNormalize(k)
-                        if savedClean == remoteClean then
-                            exactMatchKey = k
-                            break
-                        elseif not partialMatchKey and (savedClean:find(remoteClean, 1, true) or remoteClean:find(savedClean, 1, true)) then
-                            partialMatchKey = k
+                        
+                        -- Cek kecocokan persis atau rumpun tanpa spasi (misal: "djoplosan" cocok dengan "djoplosan2", "djoplosan3")
+                        if savedClean == remoteClean or savedClean:match("^" .. remoteClean .. "%d+$") then
+                            table.insert(matchedGroup, k)
+                        elseif remoteClean:match("^" .. savedClean .. "%d+$") then
+                            table.insert(matchedGroup, k)
                         end
                     end
                     
-                    local chosenKey = exactMatchKey or partialMatchKey
+                    local chosenKey = nil
+                    if #matchedGroup > 0 then
+                        math.randomseed(tick())
+                        chosenKey = matchedGroup[math.random(1, #matchedGroup)]
+                    end
                     
                     if chosenKey then
                         Notify({
                             Title = "AUTO PLAY", 
-                            Content = "Memutar rekaman: " .. chosenKey, 
+                            Content = "Memutar rekaman: " .. chosenKey .. (#matchedGroup > 1 and " (Acak dari " .. #matchedGroup .. " variasi)" or ""), 
                             Color = Color3.fromRGB(50, 160, 100)
                         })
                         RunPlayback(chosenKey, 0)
@@ -2851,13 +2851,13 @@ end)
 QuickPlayBtn.MouseButton1Click:Connect(function()
     if QuickSelectedValue ~= "" and SavedData[QuickSelectedValue] then
         RunPlayback(QuickSelectedValue, 0)
-        Notify({Title="QUICK PLAY", Content="Memutar: " .. QuickSelectedValue, Color=Color3.fromRGB(50, 160, 100)})
+        Notify({Title="QUICK PLAY", Content="Memutar: " + QuickSelectedValue, Color=Color3.fromRGB(50, 160, 100)})
     else
         Notify({Title="ERROR", Content="Pilih rekaman di list pop-up dulu!", Color=Color3.fromRGB(200, 50, 50)})
     end
 end)
 
-QuickStopBtn.MouseButton1Click:Connect(function2_or_globalstop or function()
+QuickStopBtn.MouseButton1Click:Connect(function()
     GlobalStop()
     Notify({Title="QUICK STOP", Content="Playback dihentikan", Color=Color3.fromRGB(180, 70, 70)})
 end)
