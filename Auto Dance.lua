@@ -7,18 +7,27 @@ end
 local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local Players = game:GetService("Players")
+local VirtualUser = game:GetService("VirtualUser")
 local player = Players.LocalPlayer
 local PlayerGui = player:WaitForChild("PlayerGui")
 local CoreGui = game:GetService("CoreGui")
 
 -- [ 1. STORAGE SYSTEM ]
 local FILENAME = "AutoLead.json"
+local SETTINGS_FILENAME = "AutoLeadSettings.json"
 local SavedData = {}
+local ExcludedRandomSongs = {}
 
 local function Load()
     if isfile and isfile(FILENAME) then
         local success, content = pcall(function() return HttpService:JSONDecode(readfile(FILENAME)) end)
         if success and type(content) == "table" then SavedData = content end
+    end
+    if isfile and isfile(SETTINGS_FILENAME) then
+        local success, content = pcall(function() return HttpService:JSONDecode(readfile(SETTINGS_FILENAME)) end)
+        if success and type(content) == "table" and content.ExcludedSongs then 
+            ExcludedRandomSongs = content.ExcludedSongs 
+        end
     end
 end
 
@@ -31,14 +40,40 @@ local function Save()
     return success, err
 end
 
+local function SaveSettings()
+    pcall(function()
+        if writefile then
+            local settingsData = { ExcludedSongs = ExcludedRandomSongs }
+            writefile(SETTINGS_FILENAME, HttpService:JSONEncode(settingsData))
+        end
+    end)
+end
+
 Load()
 
--- [ HELPER FORMAT TIME ]
+-- [ HELPER FORMAT & PARSE TIME ]
 local function FormatTime(seconds)
     local totalSecs = tonumber(seconds) or 0
     local mins = math.floor(totalSecs / 60)
     local secs = math.floor(totalSecs % 60)
     return string.format("%02d:%02d", mins, secs)
+end
+
+local function ParseSeekInput(inputStr)
+    if not inputStr or inputStr == "" then return 0 end
+    local cleanStr = tostring(inputStr):gsub("^%s*(.-)%s*$", "%1")
+    
+    if cleanStr:find("%.") or cleanStr:find(",") then
+        local parts = {}
+        for part in cleanStr:gmatch("[^.,]+") do
+            table.insert(parts, tonumber(part) or 0)
+        end
+        local mins = parts[1] or 0
+        local secs = parts[2] or 0
+        return (mins * 60) + secs
+    else
+        return tonumber(cleanStr) or 0
+    end
 end
 
 -- [ 2. UI SETUP ]
@@ -48,8 +83,8 @@ _G.AutoLeadGui = ScreenGui
 
 -- Main Window Frame
 local MainFrame = Instance.new("Frame", ScreenGui)
-MainFrame.Size = UDim2.fromOffset(335, 385)
-MainFrame.Position = UDim2.new(0.5, -167, 0.5, -192)
+MainFrame.Size = UDim2.fromOffset(335, 410)
+MainFrame.Position = UDim2.new(0.5, -167, 0.5, -205)
 MainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 18)
 MainFrame.BackgroundTransparency = 0.3
 MainFrame.Visible = true
@@ -80,14 +115,24 @@ TitleLabel.Font = Enum.Font.FredokaOne
 TitleLabel.TextSize = 13
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
 
--- Forward Declaration
+-- Forward Declarations
 local GlobalStop
 local RefreshLists
 local RunPlayback
+local UpdateQuickDropdownList
+local RecSelect
+local EditSelect
+local SettingDropdown
+local RefreshSettingDropdown
+local RefreshBlacklistDisplay
+local QuickSearchBox
+local QuickListFrame
 local IsAutoRemotePlayEnabled = false
+local IsAutoRemoteRecordEnabled = false
 local RemoteConnection = nil
+local AutoRecordConnection = nil
+local AntiAfkConnection = nil
 
--- Close Button (×)
 local CloseBtn = Instance.new("TextButton", TopBar)
 CloseBtn.Size = UDim2.new(0, 26, 0, 26)
 CloseBtn.Position = UDim2.new(1, -32, 0.5, -13)
@@ -106,7 +151,6 @@ CloseBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- Hide Button (–) di Samping Close
 local HideBtn = Instance.new("TextButton", TopBar)
 HideBtn.Size = UDim2.new(0, 26, 0, 26)
 HideBtn.Position = UDim2.new(1, -62, 0.5, -13)
@@ -170,14 +214,14 @@ local function CreateTabPanel(name, index, onSelectedCallback)
     layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(UpdateCanvas)
     
     local tBtn = Instance.new("TextButton", TabBar)
-    tBtn.Size = UDim2.new(0.31, 0, 0.8, 0)
+    tBtn.Size = UDim2.new(0.23, 0, 0.8, 0)
     tBtn.BackgroundColor3 = (index == 1) and Color3.fromRGB(60, 60, 72) or Color3.fromRGB(18, 18, 22)
     tBtn.BackgroundTransparency = (index == 1) and 0.1 or 0.6
     tBtn.BorderSizePixel = 0
     tBtn.Text = name
     tBtn.TextColor3 = (index == 1) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(150, 150, 165)
     tBtn.Font = Enum.Font.GothamBold
-    tBtn.TextSize = 10
+    tBtn.TextSize = 9
     Instance.new("UICorner", tBtn).CornerRadius = UDim.new(0, 6)
     
     tBtn.MouseButton1Click:Connect(function()
@@ -201,14 +245,18 @@ local function CreateTabPanel(name, index, onSelectedCallback)
 end
 
 local Tabs = {
-    Main = CreateTabPanel("RECORDER", 1),
-    Editor = CreateTabPanel("TIMELINE", 2, function()
+    Main = CreateTabPanel("REC", 1),
+    Editor = CreateTabPanel("EDIT", 2, function()
         Load()
         if RefreshLists then RefreshLists() end
     end),
-    Surgery = CreateTabPanel("PLAYBACK", 3, function()
+    Surgery = CreateTabPanel("PLAY", 3, function()
         Load()
         if RefreshLists then RefreshLists() end
+    end),
+    Setting = CreateTabPanel("SETTING", 4, function()
+        Load()
+        if RefreshSettingDropdown then RefreshSettingDropdown() end
     end)
 }
 
@@ -476,7 +524,7 @@ local function AddSearchableDropdown(parent, title, items)
     local dropLayout = Instance.new("UIListLayout", listFrame)
     dropLayout.SortOrder = Enum.SortOrder.LayoutOrder
     
-    local dropObj = { Value = "", Values = items or {} }
+    local dropObj = { Value = "", Values = items or {}, SearchBox = searchBox }
     local currentFilteredValues = {}
     
     local function RefreshValues(filterText)
@@ -493,7 +541,10 @@ local function AddSearchableDropdown(parent, title, items)
                 table.insert(sortedValues, val)
             end
         end
-        table.sort(sortedValues)
+        
+        table.sort(sortedValues, function(a, b)
+            return a:lower() < b:lower()
+        end)
         
         local count = 0
         for _, val in ipairs(sortedValues) do
@@ -664,7 +715,7 @@ local function Notify(data)
     
     UpdateNotificationPositions()
     
-    task.delay(2.5, function()
+    task.delay(5.0, function()
         pcall(function()
             local index = table.find(activeNotifications, notif)
             if index then
@@ -724,7 +775,7 @@ QuickTitle.TextColor3 = Color3.fromRGB(245, 245, 250)
 QuickTitle.Font = Enum.Font.FredokaOne
 QuickTitle.TextSize = 10
 
-local QuickSearchBox = Instance.new("TextBox", QuickFrame)
+QuickSearchBox = Instance.new("TextBox", QuickFrame)
 QuickSearchBox.Size = UDim2.new(1, -50, 0, 24)
 QuickSearchBox.Position = UDim2.new(0, 8, 0, 26)
 QuickSearchBox.BackgroundColor3 = Color3.fromRGB(26, 26, 34)
@@ -750,7 +801,7 @@ QuickRefreshBtn.Font = Enum.Font.GothamBold
 QuickRefreshBtn.TextSize = 10
 Instance.new("UICorner", QuickRefreshBtn).CornerRadius = UDim.new(0, 5)
 
-local QuickListFrame = Instance.new("ScrollingFrame", QuickFrame)
+QuickListFrame = Instance.new("ScrollingFrame", QuickFrame)
 QuickListFrame.Size = UDim2.new(1, -16, 0, 0)
 QuickListFrame.Position = UDim2.new(0, 8, 0, 54)
 QuickListFrame.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
@@ -791,7 +842,7 @@ Instance.new("UICorner", QuickStopBtn).CornerRadius = UDim.new(0, 6)
 local QuickSelectedValue = ""
 local QuickFilteredValues = {}
 
-local function UpdateQuickDropdownList(filterText)
+UpdateQuickDropdownList = function(filterText)
     filterText = filterText or ""
     for _, c in pairs(QuickListFrame:GetChildren()) do
         if c:IsA("TextButton") then c:Destroy() end
@@ -806,7 +857,9 @@ local function UpdateQuickDropdownList(filterText)
             table.insert(matchedNames, name)
         end
     end
-    table.sort(matchedNames)
+    table.sort(matchedNames, function(a, b)
+        return a:lower() < b:lower()
+    end)
     
     local count = 0
     for _, name in ipairs(matchedNames) do
@@ -968,7 +1021,7 @@ MakeDraggable(MainFrame, TopBar)
 MakeDraggable(ToggleButton)
 MakeDraggable(QuickFrame)
 
--- [ 3. CORE VARIABLES ]
+-- [ 3. CORE VARIABLES & SETUP TABS ]
 local IsRecording, IsPlayingPlayback = false, false
 local CurrentPlaybackThread = nil
 local TempSession = {}
@@ -976,13 +1029,231 @@ local StartTime = 0
 local CharacterConnection = nil
 local IsFromRandomLoop = false
 
--- [ NOW PLAYING UI COMPONENTS ]
+-- TAB 1: RECORDER
+local RecToggle = AddBigRecordToggle(Tabs.Main, function(value)
+    IsRecording = value
+    if IsRecording then GlobalStop() IsRecording = true TempSession = {} StartTime = tick() end
+end)
+
+local RecNameInput = AddInputUI(Tabs.Main, "NAMA DANCE", "Dance_1", "Masukkan nama dance...")
+AddButtonUI(Tabs.Main, "💾 SIMPAN HASIL REKAMAN", function()
+    if #TempSession == 0 then
+        Notify({Title="ERROR", Content="Belum ada animasi yang terekam!", Duration=2.0})
+        return
+    end
+    if not RecNameInput.Value or RecNameInput.Value == "" then
+        Notify({Title="ERROR", Content="Nama dance tidak boleh kosong!", Duration=2.0})
+        return
+    end
+    
+    Load()
+    SavedData[RecNameInput.Value] = TempSession
+    local success, err = Save()
+    
+    if success then
+        RecToggle:SetValue(false)
+        RefreshLists()
+        Notify({Title="SAVED", Content="Rekaman berhasil disimpan!", Duration = 2.0})
+    else
+        Notify({Title="SAVE FAILED", Content=tostring(err or "Executor block writefile"), Duration = 2.0})
+    end
+end)
+
+local currentAutoRecordSong = nil
+local AutoRecStatusContainer = Instance.new("Frame", Tabs.Main)
+AutoRecStatusContainer.Size = UDim2.new(1, -4, 0, 46)
+AutoRecStatusContainer.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+AutoRecStatusContainer.BackgroundTransparency = 0.3
+AutoRecStatusContainer.BorderSizePixel = 0
+AutoRecStatusContainer.Visible = false
+Instance.new("UICorner", AutoRecStatusContainer).CornerRadius = UDim.new(0, 8)
+
+local AutoRecStatusTitle = Instance.new("TextLabel", AutoRecStatusContainer)
+AutoRecStatusTitle.Size = UDim2.new(1, -12, 0, 16)
+AutoRecStatusTitle.Position = UDim2.new(0, 8, 0, 4)
+AutoRecStatusTitle.BackgroundTransparency = 1
+AutoRecStatusTitle.BorderSizePixel = 0
+AutoRecStatusTitle.Text = "● STATUS AUTO-RECORD"
+AutoRecStatusTitle.TextColor3 = Color3.fromRGB(0, 255, 170)
+AutoRecStatusTitle.Font = Enum.Font.GothamBold
+AutoRecStatusTitle.TextSize = 9
+AutoRecStatusTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+local AutoRecStatusSongLabel = Instance.new("TextLabel", AutoRecStatusContainer)
+AutoRecStatusSongLabel.Size = UDim2.new(0.65, 0, 0, 22)
+AutoRecStatusSongLabel.Position = UDim2.new(0, 8, 0, 20)
+AutoRecStatusSongLabel.BackgroundTransparency = 1
+AutoRecStatusSongLabel.BorderSizePixel = 0
+AutoRecStatusSongLabel.Text = "Idle..."
+AutoRecStatusSongLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
+AutoRecStatusSongLabel.Font = Enum.Font.GothamMedium
+AutoRecStatusSongLabel.TextSize = 10
+AutoRecStatusSongLabel.TextXAlignment = Enum.TextXAlignment.Left
+AutoRecStatusSongLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+local AutoRecStatusTimeLabel = Instance.new("TextLabel", AutoRecStatusContainer)
+AutoRecStatusTimeLabel.Size = UDim2.new(0.33, 0, 0, 22)
+AutoRecStatusTimeLabel.Position = UDim2.new(0.67, -8, 0, 20)
+AutoRecStatusTimeLabel.BackgroundTransparency = 1
+AutoRecStatusTimeLabel.BorderSizePixel = 0
+AutoRecStatusTimeLabel.Text = "00:00"
+AutoRecStatusTimeLabel.TextColor3 = Color3.fromRGB(0, 255, 170)
+AutoRecStatusTimeLabel.Font = Enum.Font.GothamBold
+AutoRecStatusTimeLabel.TextSize = 10
+AutoRecStatusTimeLabel.TextXAlignment = Enum.TextXAlignment.Right
+
+local autoRecTimerThread = nil
+
+AddToggleUI(Tabs.Main, "AUTO RECORD VIA REMOTE", false, function(Value)
+    IsAutoRemoteRecordEnabled = Value
+    
+    if AutoRecordConnection then
+        pcall(function() AutoRecordConnection:Disconnect() end)
+        AutoRecordConnection = nil
+    end
+    
+    if autoRecTimerThread then
+        task.cancel(autoRecTimerThread)
+        autoRecTimerThread = nil
+    end
+    
+    if Value then
+        AutoRecStatusContainer.Visible = true
+        autoRecTimerThread = task.spawn(function()
+            while IsAutoRemoteRecordEnabled do
+                if IsRecording and StartTime > 0 then
+                    local elapsed = tick() - StartTime
+                    AutoRecStatusTimeLabel.Text = FormatTime(elapsed)
+                    if currentAutoRecordSong then
+                        AutoRecStatusSongLabel.Text = "Merekam: " .. currentAutoRecordSong
+                    end
+                else
+                    AutoRecStatusSongLabel.Text = "Menunggu lagu..."
+                    AutoRecStatusTimeLabel.Text = "00:00"
+                end
+                task.wait(0.5)
+            end
+        end)
+        
+        task.spawn(function()
+            local djFolder = game:GetService("ReplicatedStorage"):WaitForChild("DJRemotes", 5)
+            local djEvent = djFolder and djFolder:WaitForChild("UpdateNowPlaying", 5)
+            
+            if djEvent and djEvent:IsA("RemoteEvent") then
+                local function HandleAutoRecordRemote(...)
+                    if not IsAutoRemoteRecordEnabled then return end
+                    
+                    local args = {...}
+                    local rawName = ""
+                    
+                    for _, arg in ipairs(args) do
+                        if type(arg) == "string" and arg ~= "" then
+                            rawName = arg
+                            break
+                        elseif type(arg) == "table" then
+                            rawName = tostring(arg.Name or arg.Title or arg.Song or arg.SongName or arg[1] or "")
+                            if rawName ~= "" then break end
+                        end
+                    end
+                    
+                    if rawName == "" and #args > 0 then
+                        rawName = tostring(args[1])
+                    end
+                    
+                    if rawName == "" or rawName == "nil" then return end
+                    
+                    local songName = string.gsub(rawName, "^%s*(.-)%s*$", "%1")
+                    
+                    if IsRecording and currentAutoRecordSong and currentAutoRecordSong ~= songName then
+                        if #TempSession > 0 then
+                            Load()
+                            local finalName = currentAutoRecordSong
+                            local count = 1
+                            while SavedData[finalName] do
+                                finalName = currentAutoRecordSong .. count
+                                count = count + 1
+                            end
+                            
+                            SavedData[finalName] = TempSession
+                            Save()
+                            RefreshLists()
+                            Notify({Title="AUTO SAVED", Content="Tersimpan: " .. finalName, Color=Color3.fromRGB(50, 160, 100)})
+                        end
+                        IsRecording = false
+                        RecToggle:SetValue(false)
+                    end
+                    
+                    if not IsRecording then
+                        currentAutoRecordSong = songName
+                        TempSession = {}
+                        StartTime = tick()
+                        IsRecording = true
+                        RecToggle:SetValue(true)
+                        AutoRecStatusSongLabel.Text = "Merekam: " .. songName
+                        Notify({Title="AUTO RECORD", Content="Mulai merekam: " .. songName, Color=Color3.fromRGB(0, 170, 255)})
+                    end
+                end
+                
+                AutoRecordConnection = djEvent.OnClientEvent:Connect(HandleAutoRecordRemote)
+                Notify({Title="AUTO RECORD", Content="Standby mendengarkan DJRemotes", Color=Color3.fromRGB(50, 160, 100)})
+            else
+                Notify({Title="WARNING", Content="Event DJRemotes tidak ditemukan!", Color=Color3.fromRGB(200, 50, 50)})
+            end
+        end)
+    else
+        AutoRecStatusContainer.Visible = false
+        if IsRecording and currentAutoRecordSong then
+            if #TempSession > 0 then
+                Load()
+                local finalName = currentAutoRecordSong
+                local count = 1
+                while SavedData[finalName] do
+                    finalName = currentAutoRecordSong .. count
+                    count = count + 1
+                end
+                SavedData[finalName] = TempSession
+                Save()
+                RefreshLists()
+                Notify({Title="AUTO SAVED", Content="Tersimpan: " .. finalName, Color=Color3.fromRGB(50, 160, 100)})
+            end
+            IsRecording = false
+            RecToggle:SetValue(false)
+            currentAutoRecordSong = nil
+        end
+    end
+end)
+
+-- TAB 2: TIMELINE / EDITOR
+AddSectionHeader(Tabs.Editor, "PILIH & EDIT")
+EditSelect = AddSearchableDropdown(Tabs.Editor, "PILIH REKAMAN UNTUK DIEDIT", {})
+
+AddSectionHeader(Tabs.Editor, "GANTI NAMA REKAMAN")
+local NewNameInputObj = AddInputUI(Tabs.Editor, "NAMA BARU", "", "Masukkan nama baru...")
+
+AddButtonUI(Tabs.Editor, "📝 GANTI NAMA (RENAME)", function()
+    local oldName = EditSelect.Value
+    local newName = NewNameInputObj.Value
+    if not oldName or oldName == "" or not newName or newName == "" or newName == oldName then return end
+    if SavedData[newName] then return end
+
+    SavedData[newName] = SavedData[oldName]
+    SavedData[oldName] = nil
+    Save()
+    if RefreshLists then RefreshLists() end
+    Notify({Title = "SUCCESS", Content = string.format("Rekaman '%s' diganti menjadi '%s'", oldName, newName), Duration = 2.0})
+end)
+
+AddSectionHeader(Tabs.Editor, "EDITOR")
+AddButtonUI(Tabs.Editor, "🛠 BUKA TIMELINE", function() end)
+AddButtonUI(Tabs.Editor, "💾 SIMPAN PERUBAHAN", Save)
+
+-- TAB 3: PLAYBACK (NOW PLAYING SELALU TAMPIL DI ATAS)
 local NowPlayingContainer = Instance.new("Frame", Tabs.Surgery)
 NowPlayingContainer.Size = UDim2.new(1, -4, 0, 52)
 NowPlayingContainer.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
 NowPlayingContainer.BackgroundTransparency = 0.3
 NowPlayingContainer.BorderSizePixel = 0
-NowPlayingContainer.Visible = false
+NowPlayingContainer.Visible = true
 Instance.new("UICorner", NowPlayingContainer).CornerRadius = UDim.new(0, 8)
 
 local NowPlayingTitle = Instance.new("TextLabel", NowPlayingContainer)
@@ -997,28 +1268,185 @@ NowPlayingTitle.TextSize = 9
 NowPlayingTitle.TextXAlignment = Enum.TextXAlignment.Left
 
 local NowPlayingSongLabel = Instance.new("TextLabel", NowPlayingContainer)
-NowPlayingSongLabel.Size = UDim2.new(0.65, 0, 0, 24)
+NowPlayingSongLabel.Size = UDim2.new(0.50, 0, 0, 24)
 NowPlayingSongLabel.Position = UDim2.new(0, 8, 0, 22)
 NowPlayingSongLabel.BackgroundTransparency = 1
 NowPlayingSongLabel.BorderSizePixel = 0
-NowPlayingSongLabel.Text = ""
-NowPlayingSongLabel.TextColor3 = Color3.fromRGB(0, 255, 170)
+NowPlayingSongLabel.Text = "IDLE"
+NowPlayingSongLabel.TextColor3 = Color3.fromRGB(150, 150, 165)
 NowPlayingSongLabel.Font = Enum.Font.FredokaOne
 NowPlayingSongLabel.TextSize = 11
 NowPlayingSongLabel.TextXAlignment = Enum.TextXAlignment.Left
 
+local SeekInputSmall = Instance.new("TextBox", NowPlayingContainer)
+SeekInputSmall.Size = UDim2.new(0, 42, 0, 20)
+SeekInputSmall.Position = UDim2.new(0.52, 0, 0, 24)
+SeekInputSmall.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+SeekInputSmall.BackgroundTransparency = 0.2
+SeekInputSmall.BorderSizePixel = 0
+SeekInputSmall.Text = ""
+SeekInputSmall.PlaceholderText = "Cth:30"
+SeekInputSmall.TextColor3 = Color3.fromRGB(255, 255, 255)
+SeekInputSmall.PlaceholderColor3 = Color3.fromRGB(140, 140, 155)
+SeekInputSmall.Font = Enum.Font.Gotham
+SeekInputSmall.TextSize = 9
+Instance.new("UICorner", SeekInputSmall).CornerRadius = UDim.new(0, 4)
+
+local SeekGoBtn = Instance.new("TextButton", NowPlayingContainer)
+SeekGoBtn.Size = UDim2.new(0, 24, 0, 20)
+SeekGoBtn.Position = UDim2.new(0.52, 44, 0, 24)
+SeekGoBtn.BackgroundColor3 = Color3.fromRGB(50, 160, 100)
+SeekGoBtn.BackgroundTransparency = 0.3
+SeekGoBtn.BorderSizePixel = 0
+SeekGoBtn.Text = "⏩"
+SeekGoBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+SeekGoBtn.Font = Enum.Font.GothamBold
+SeekGoBtn.TextSize = 9
+Instance.new("UICorner", SeekGoBtn).CornerRadius = UDim.new(0, 4)
+
 local NowPlayingTimeLabel = Instance.new("TextLabel", NowPlayingContainer)
-NowPlayingTimeLabel.Size = UDim2.new(0.33, 0, 0, 24)
-NowPlayingTimeLabel.Position = UDim2.new(0.67, -8, 0, 22)
+NowPlayingTimeLabel.Size = UDim2.new(0.35, 0, 0, 24)
+NowPlayingTimeLabel.Position = UDim2.new(0.65, -8, 0, 22)
 NowPlayingTimeLabel.BackgroundTransparency = 1
 NowPlayingTimeLabel.BorderSizePixel = 0
-NowPlayingTimeLabel.Text = ""
+NowPlayingTimeLabel.Text = "00:00 / 00:00"
 NowPlayingTimeLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 NowPlayingTimeLabel.Font = Enum.Font.GothamBold
 NowPlayingTimeLabel.TextSize = 10
 NowPlayingTimeLabel.TextXAlignment = Enum.TextXAlignment.Right
 
--- [ 4. PROTOCOL ENGINE & GLOBAL CLEANUP ]
+RecSelect = AddSearchableDropdown(Tabs.Surgery, "REKAMAN", {})
+
+RefreshLists = function()
+    local n = {} 
+    if SavedData then
+        for k, _ in pairs(SavedData) do table.insert(n, k) end
+        table.sort(n, function(a, b)
+            return a:lower() < b:lower()
+        end) 
+        if RecSelect then RecSelect:SetValues(n) end
+        if EditSelect then EditSelect:SetValues(n) end
+        if RefreshSettingDropdown then RefreshSettingDropdown() end
+    end
+    UpdateQuickDropdownList(QuickSearchBox.Text)
+end
+
+-- [ TAB 4: SETTING (PENGECUALIAN RANDOM DENGAN TOMBOL "LIST") ]
+AddSectionHeader(Tabs.Setting, "PENGATURAN RANDOM")
+SettingDropdown = AddSearchableDropdown(Tabs.Setting, "PILIH LAGU UNTUK DIKECUALIKAN", {})
+
+AddButtonUI(Tabs.Setting, "🚫 TAMBAH KE BLACKLIST", function()
+    local songToExclude = SettingDropdown.Value
+    if not songToExclude or songToExclude == "" then
+        Notify({Title="ERROR", Content="Pilih lagu terlebih dahulu!", Color=Color3.fromRGB(200, 50, 50)})
+        return
+    end
+    
+    if not table.find(ExcludedRandomSongs, songToExclude) then
+        table.insert(ExcludedRandomSongs, songToExclude)
+        SaveSettings()
+        Notify({Title="BLACKLIST", Content="Berhasil mengecualikan: " .. songToExclude, Color=Color3.fromRGB(255, 140, 0)})
+        if RefreshBlacklistDisplay then RefreshBlacklistDisplay() end
+    else
+        Notify({Title="INFO", Content="Lagu sudah ada di daftar pengecualian.", Color=Color3.fromRGB(0, 170, 255)})
+    end
+end)
+
+local ViewListBtn = AddButtonUI(Tabs.Setting, "📂 LIST (BUKA DAFTAR BLACKLIST)", function() end)
+
+local BlacklistContainer = Instance.new("ScrollingFrame", Tabs.Setting)
+BlacklistContainer.Size = UDim2.new(1, -4, 0, 110)
+BlacklistContainer.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+BlacklistContainer.BackgroundTransparency = 0.4
+BlacklistContainer.BorderSizePixel = 0
+BlacklistContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+BlacklistContainer.ScrollBarThickness = 3
+BlacklistContainer.Visible = false
+Instance.new("UICorner", BlacklistContainer).CornerRadius = UDim.new(0, 7)
+
+local BlacklistLayout = Instance.new("UIListLayout", BlacklistContainer)
+BlacklistLayout.SortOrder = Enum.SortOrder.LayoutOrder
+BlacklistLayout.Padding = UDim.new(0, 3)
+
+RefreshBlacklistDisplay = function()
+    for _, c in pairs(BlacklistContainer:GetChildren()) do
+        if c:IsA("Frame") or c:IsA("TextLabel") then c:Destroy() end
+    end
+    
+    if #ExcludedRandomSongs == 0 then
+        local emptyLbl = Instance.new("TextLabel", BlacklistContainer)
+        emptyLbl.Size = UDim2.new(1, 0, 1, 0)
+        emptyLbl.BackgroundTransparency = 1
+        emptyLbl.Text = "(List Blacklist Kosong)"
+        emptyLbl.TextColor3 = Color3.fromRGB(150, 150, 165)
+        emptyLbl.Font = Enum.Font.GothamItalic
+        emptyLbl.TextSize = 10
+        return
+    end
+    
+    for i, songName in ipairs(ExcludedRandomSongs) do
+        local itemRow = Instance.new("Frame", BlacklistContainer)
+        itemRow.Size = UDim2.new(1, 0, 0, 26)
+        itemRow.BackgroundTransparency = 1
+        
+        local nameLbl = Instance.new("TextLabel", itemRow)
+        nameLbl.Size = UDim2.new(1, -35, 1, 0)
+        nameLbl.Position = UDim2.new(0, 6, 0, 0)
+        nameLbl.BackgroundTransparency = 1
+        nameLbl.Text = "- " .. songName
+        nameLbl.TextColor3 = Color3.fromRGB(255, 140, 140)
+        nameLbl.Font = Enum.Font.GothamMedium
+        nameLbl.TextSize = 10
+        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+        nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+        
+        local removeBtn = Instance.new("TextButton", itemRow)
+        removeBtn.Size = UDim2.new(0, 22, 0, 22)
+        removeBtn.Position = UDim2.new(1, -26, 0.5, -11)
+        removeBtn.BackgroundColor3 = Color3.fromRGB(180, 70, 70)
+        removeBtn.BackgroundTransparency = 0.3
+        removeBtn.BorderSizePixel = 0
+        removeBtn.Text = "×"
+        removeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        removeBtn.Font = Enum.Font.GothamBold
+        removeBtn.TextSize = 12
+        Instance.new("UICorner", removeBtn).CornerRadius = UDim.new(0, 4)
+        
+        removeBtn.MouseButton1Click:Connect(function()
+            local idx = table.find(ExcludedRandomSongs, songName)
+            if idx then
+                table.remove(ExcludedRandomSongs, idx)
+                SaveSettings()
+                RefreshBlacklistDisplay()
+                Notify({Title="BLACKLIST", Content="Dihapus dari list: " .. songName, Color=Color3.fromRGB(50, 160, 100)})
+            end
+        end)
+    end
+    
+    BlacklistContainer.CanvasSize = UDim2.new(0, 0, 0, #ExcludedRandomSongs * 29)
+end
+
+ViewListBtn.MouseButton1Click:Connect(function()
+    BlacklistContainer.Visible = not BlacklistContainer.Visible
+    if BlacklistContainer.Visible then
+        ViewListBtn.Text = "📂 LIST (TUTUP DAFTAR BLACKLIST)"
+        RefreshBlacklistDisplay()
+    else
+        ViewListBtn.Text = "📂 LIST (BUKA DAFTAR BLACKLIST)"
+    end
+end)
+
+RefreshSettingDropdown = function()
+    local allKeys = {}
+    if SavedData then
+        for k, _ in pairs(SavedData) do table.insert(allKeys, k) end
+    end
+    if SettingDropdown then SettingDropdown:SetValues(allKeys) end
+    RefreshBlacklistDisplay()
+end
+
+
+-- PROTOCOL ENGINE & GLOBAL CLEANUP
 GlobalStop = function()
     IsPlayingPlayback = false
     IsRecording = false
@@ -1029,9 +1457,9 @@ GlobalStop = function()
         CurrentPlaybackThread = nil 
     end
     
-    NowPlayingSongLabel.Text = ""
-    NowPlayingTimeLabel.Text = ""
-    NowPlayingContainer.Visible = false
+    NowPlayingSongLabel.Text = "IDLE"
+    NowPlayingSongLabel.TextColor3 = Color3.fromRGB(150, 150, 165)
+    NowPlayingTimeLabel.Text = "00:00 / 00:00"
     
     pcall(function()
         local Events = game:GetService("ReplicatedStorage"):FindFirstChild("Events")
@@ -1053,11 +1481,12 @@ getgenv().AutoLeadCleanup = function()
     GlobalStop()
     if CharacterConnection then pcall(function() CharacterConnection:Disconnect() end) end
     if RemoteConnection then pcall(function() RemoteConnection:Disconnect() end) end
+    if AutoRecordConnection then pcall(function() AutoRecordConnection:Disconnect() end) end
+    if AntiAfkConnection then pcall(function() AntiAfkConnection:Disconnect() end) end
     if ScreenGui then pcall(function() ScreenGui:Destroy() end) end
     getgenv().AutoLeadCleanup = nil
 end
 
--- [ 6. RECORDER ]
 local function SetupRecorder()
     local Char = player.Character or player.CharacterAdded:Wait()
     local Hum = Char:WaitForChild("Humanoid")
@@ -1093,122 +1522,29 @@ end
 SetupRecorder()
 CharacterConnection = player.CharacterAdded:Connect(SetupRecorder)
 
--- [ 7. EDITOR LOGIC & UI ACTIONS ]
-local EditorList = {}
-local SelectedRecForEdit = ""
-local RefreshEditorUI
-
-RefreshEditorUI = function()
-    for _, v in pairs(EditorList) do if v and v.Destroy then v:Destroy() end end
-    table.clear(EditorList)
-    
-    local data = SavedData[SelectedRecForEdit]
-    if not data then return end
-    
-    for i, entry in ipairs(data) do
-        local label = entry.isSpeedUpdateOnly and "⚡ SPEED" or "🎬 ANIM"
-        local section = AddSectionHeader(Tabs.Editor, string.format("[%d] %s", i, label))
-        table.insert(EditorList, section)
-        
-        local timeInp = AddInputUI(Tabs.Editor, "WAKTU (DETIK)", tostring(math.floor(entry.time * 1000)/1000), "", function(v)
-            entry.time = tonumber(v) or entry.time
-        end)
-        
-        local speedInp = AddInputUI(Tabs.Editor, "KECEPATAN", tostring(entry.speed), "", function(v)
-            entry.speed = tonumber(v) or entry.speed
-        end)
-        
-        local delBtn = AddButtonUI(Tabs.Editor, "❌ HAPUS ENTRY INI", function()
-            table.remove(data, i)
-            Save()
-            RefreshEditorUI()
-        end)
-        
-        table.insert(EditorList, timeInp.Box.Parent)
-        table.insert(EditorList, speedInp.Box.Parent)
-        table.insert(EditorList, delBtn)
-    end
-end
-
-local RecToggle = AddBigRecordToggle(Tabs.Main, function(value)
-    IsRecording = value
-    if IsRecording then GlobalStop() IsRecording = true TempSession = {} StartTime = tick() end
-end)
-
-local RecNameInput = AddInputUI(Tabs.Main, "NAMA DANCE", "Dance_1", "Masukkan nama dance...")
-AddButtonUI(Tabs.Main, "💾 SIMPAN HASIL REKAMAN", function()
-    if #TempSession == 0 then
-        Notify({Title="ERROR", Content="Belum ada animasi yang terekam!", Duration=2.0})
-        return
-    end
-    if not RecNameInput.Value or RecNameInput.Value == "" then
-        Notify({Title="ERROR", Content="Nama dance tidak boleh kosong!", Duration=2.0})
-        return
-    end
-    
-    Load()
-    SavedData[RecNameInput.Value] = TempSession
-    local success, err = Save()
-    
-    if success then
-        RecToggle:SetValue(false)
-        RefreshLists()
-        Notify({Title="SAVED", Content="Rekaman berhasil disimpan!", Duration = 2.0})
-    else
-        Notify({Title="SAVE FAILED", Content=tostring(err or "Executor block writefile"), Duration = 2.0})
-    end
-end)
-
-AddSectionHeader(Tabs.Editor, "PILIH & EDIT")
-local EditSelect = AddSearchableDropdown(Tabs.Editor, "PILIH REKAMAN UNTUK DIEDIT", {})
-
-AddSectionHeader(Tabs.Editor, "GANTI NAMA REKAMAN")
-local NewNameInputObj = AddInputUI(Tabs.Editor, "NAMA BARU", "", "Masukkan nama baru...")
-
-AddButtonUI(Tabs.Editor, "📝 GANTI NAMA (RENAME)", function()
-    local oldName = EditSelect.Value
-    local newName = NewNameInputObj.Value
-    if not oldName or oldName == "" or not newName or newName == "" or newName == oldName then return end
-    if SavedData[newName] then return end
-
-    SavedData[newName] = SavedData[oldName]
-    SavedData[oldName] = nil
-    Save()
-    if RefreshLists then RefreshLists() end
-    Notify({Title = "SUCCESS", Content = string.format("Rekaman '%s' diganti menjadi '%s'", oldName, newName), Duration = 2.0})
-end)
-
-AddSectionHeader(Tabs.Editor, "EDITOR")
-AddButtonUI(Tabs.Editor, "🛠 BUKA TIMELINE", function()
-    SelectedRecForEdit = EditSelect.Value
-    RefreshEditorUI()
-end)
-AddButtonUI(Tabs.Editor, "💾 SIMPAN PERUBAHAN", Save)
-
--- [ TAB PLAYBACK ]
-local RecSelect = AddSearchableDropdown(Tabs.Surgery, "REKAMAN", {})
-
-RefreshLists = function()
-    local n = {} 
-    if SavedData then
-        for k, _ in pairs(SavedData) do table.insert(n, k) end
-        table.sort(n) 
-        RecSelect:SetValues(n)
-        if EditSelect then EditSelect:SetValues(n) end
-    end
-    UpdateQuickDropdownList(QuickSearchBox.Text)
-end
-
-RunPlayback = function(targetName, isRandomLoop)
-    if not targetName or not SavedData[targetName] then 
-        local keys = {}
-        for k, _ in pairs(SavedData) do table.insert(keys, k) end
-        if #keys > 0 then
-            math.randomseed(tick())
-            targetName = keys[math.random(1, #keys)]
-        else
-            return 
+local function GetValidRandomKey()
+    local availableKeys = {}
+    for k, _ in pairs(SavedData) do
+        if not table.find(ExcludedRandomSongs, k) then
+            table.insert(availableKeys, k)
         end
+    end
+    
+    if #availableKeys == 0 then
+        for k, _ in pairs(SavedData) do table.insert(availableKeys, k) end
+    end
+    
+    if #availableKeys > 0 then
+        math.randomseed(tick())
+        return availableKeys[math.random(1, #availableKeys)]
+    end
+    return nil
+end
+
+RunPlayback = function(targetName, isRandomLoop, seekSeconds)
+    if not targetName or not SavedData[targetName] then 
+        targetName = GetValidRandomKey()
+        if not targetName then return end
     end
     
     IsPlayingPlayback = false
@@ -1220,13 +1556,14 @@ RunPlayback = function(targetName, isRandomLoop)
     
     IsPlayingPlayback = true
     IsFromRandomLoop = isRandomLoop or false
-    local pStart = tick()
     
     CurrentPlaybackThread = task.spawn(function()
         local rawDataList = SavedData[targetName] 
         if not rawDataList or type(rawDataList) ~= "table" or #rawDataList == 0 then 
             IsPlayingPlayback = false 
-            NowPlayingContainer.Visible = false
+            NowPlayingSongLabel.Text = "IDLE"
+            NowPlayingSongLabel.TextColor3 = Color3.fromRGB(150, 150, 165)
+            NowPlayingTimeLabel.Text = "00:00 / 00:00"
             return 
         end
         
@@ -1260,27 +1597,41 @@ RunPlayback = function(targetName, isRandomLoop)
 
         if #processedData == 0 then
             IsPlayingPlayback = false
-            NowPlayingContainer.Visible = false
+            NowPlayingSongLabel.Text = "IDLE"
+            NowPlayingSongLabel.TextColor3 = Color3.fromRGB(150, 150, 165)
+            NowPlayingTimeLabel.Text = "00:00 / 00:00"
             return
         end
 
         local totalDuration = processedData[#processedData].time or 0
+        local targetSeek = math.clamp(seekSeconds or 0, 0, totalDuration)
+        local pStart = tick() - targetSeek
+        
         NowPlayingSongLabel.Text = string.upper(targetName)
-        NowPlayingContainer.Visible = true
+        NowPlayingSongLabel.TextColor3 = Color3.fromRGB(0, 255, 170)
 
         local Events = game:GetService("ReplicatedStorage"):FindFirstChild("Events")
         local UpdateAnimationEvent = Events and Events:FindFirstChild("UpdateAnimation")
         local UpdateSpeedEvent = Events and Events:FindFirstChild("UpdateSpeed")
 
-        local firstData = processedData[1]
-        if firstData and UpdateAnimationEvent then
-            pcall(function() UpdateAnimationEvent:FireServer(firstData.id) end)
+        local startIndex = 1
+        for idx, data in ipairs(processedData) do
+            if data.time >= targetSeek then
+                startIndex = math.max(1, idx - 1)
+                break
+            end
+            startIndex = idx
+        end
+
+        local startData = processedData[startIndex]
+        if startData and UpdateAnimationEvent then
+            pcall(function() UpdateAnimationEvent:FireServer(startData.id) end)
             if UpdateSpeedEvent then
-                pcall(function() UpdateSpeedEvent:FireServer(firstData.speed or 1) end)
+                pcall(function() UpdateSpeedEvent:FireServer(startData.speed or 1) end)
             end
         end
 
-        for i = 2, #processedData do
+        for i = startIndex + 1, #processedData do
             if not IsPlayingPlayback then break end
             local data = processedData[i]
             
@@ -1311,31 +1662,62 @@ RunPlayback = function(targetName, isRandomLoop)
         IsPlayingPlayback = false
         
         task.wait(0.5)
-        NowPlayingContainer.Visible = false
-        NowPlayingSongLabel.Text = ""
-        NowPlayingTimeLabel.Text = ""
+        NowPlayingSongLabel.Text = "IDLE"
+        NowPlayingSongLabel.TextColor3 = Color3.fromRGB(150, 150, 165)
+        NowPlayingTimeLabel.Text = "00:00 / 00:00"
         
         if IsAutoRemotePlayEnabled and not IsPlayingPlayback and not IsRecording then
-            local keys = {}
-            for k, _ in pairs(SavedData) do table.insert(keys, k) end
-            if #keys > 0 then
-                math.randomseed(tick())
-                local randomKey = keys[math.random(1, #keys)]
-                Notify({Title="AUTO PLAY", Content="Lanjut Random: " .. randomKey, Color=Color3.fromRGB(255, 140, 0)})
-                RunPlayback(randomKey, true)
+            Notify({
+                Title = "AUTO PLAY", 
+                Content = "Rekaman selesai. Jeda 3 detik...", 
+                Color = Color3.fromRGB(255, 140, 0)
+            })
+            
+            task.wait(3)
+            
+            if IsAutoRemotePlayEnabled and not IsPlayingPlayback and not IsRecording then
+                local randomKey = GetValidRandomKey()
+                if randomKey then
+                    Notify({Title="AUTO PLAY", Content="Lanjut Random: " .. randomKey, Color=Color3.fromRGB(255, 140, 0)})
+                    RunPlayback(randomKey, true, 0)
+                end
             end
         end
     end)
 end
 
+SeekGoBtn.MouseButton1Click:Connect(function()
+    local currentPlaying = NowPlayingSongLabel.Text
+    if not currentPlaying or currentPlaying == "IDLE" or currentPlaying == "" then
+        Notify({Title="ERROR", Content="Tidak ada rekaman yang sedang diputar!", Color=Color3.fromRGB(200, 50, 50)})
+        return
+    end
+    
+    local seekSeconds = ParseSeekInput(SeekInputSmall.Text)
+    local actualKey = nil
+    
+    for k, _ in pairs(SavedData) do
+        if k:lower() == currentPlaying:lower() then
+            actualKey = k
+            break
+        end
+    end
+    
+    if actualKey and SavedData[actualKey] then
+        RunPlayback(actualKey, false, seekSeconds)
+        Notify({Title="SEEK", Content=string.format("Melompat ke: %.1fs", seekSeconds), Color=Color3.fromRGB(50, 160, 100)})
+    else
+        Notify({Title="ERROR", Content="Data rekaman tidak ditemukan!", Color=Color3.fromRGB(200, 50, 50)})
+    end
+end)
+
 AddDualButtonUI(Tabs.Surgery, "▶ START PLAYBACK", Color3.fromRGB(50, 160, 100), function()
-    RunPlayback(RecSelect.Value, false)
+    RunPlayback(RecSelect.Value, false, 0)
 end, "⏹ STOP", Color3.fromRGB(180, 70, 70), function()
     GlobalStop()
     Notify({Title="SYSTEM", Content="Playback dihentikan", Duration = 2.0})
 end)
 
--- Tombol Toggle Auto Play via Remote (Random Choice + Dual Notification)
 AddToggleUI(Tabs.Surgery, "AUTO PLAY VIA REMOTE", false, function(Value)
     IsAutoRemotePlayEnabled = Value
     
@@ -1372,43 +1754,46 @@ AddToggleUI(Tabs.Surgery, "AUTO PLAY VIA REMOTE", false, function(Value)
                     
                     if rawName == "" or rawName == "nil" then return end
                     
-                    local remoteName = string.lower(string.gsub(rawName, "^%s*(.-)%s*$", "%1"))
+                    local remoteNameClean = string.lower(string.gsub(rawName, "[%s%-_%p]", ""))
                     
-                    -- NOTIFIKASI 1: Lagu terdeteksi dari remote
-                    Notify({
-                        Title = "DETEKSI REMOTE", 
-                        Content = "Lagu terdeteksi: " .. rawName, 
-                        Color = Color3.fromRGB(0, 170, 255)
-                    })
-                    
+                    local exactMatchKey = nil
                     local matchedKeys = {}
                     
                     for k, _ in pairs(SavedData) do
-                        local savedKeyLower = string.lower(string.gsub(k, "^%s*(.-)%s*$", "%1"))
-                        if savedKeyLower == remoteName or remoteName:find(savedKeyLower, 1, true) or savedKeyLower:find(remoteName, 1, true) then
+                        local savedKeyClean = string.lower(string.gsub(k, "[%s%-_%p]", ""))
+                        if savedKeyClean == remoteNameClean then
+                            exactMatchKey = k
+                            break
+                        elseif string.find(remoteNameClean, savedKeyClean, 1, true) or string.find(savedKeyClean, remoteNameClean, 1, true) then
                             table.insert(matchedKeys, k)
                         end
                     end
                     
-                    if #matchedKeys > 0 then
-                        math.randomseed(tick())
-                        local chosenKey = matchedKeys[math.random(1, #matchedKeys)]
-                        
-                        local notifText = (#matchedKeys > 1) and string.format("Acak (%d opsi) & Memutar: %s", #matchedKeys, chosenKey) or ("Cocok & Memutar: " .. chosenKey)
-                        
-                        -- NOTIFIKASI 2: Lagu cocok & mulai diputar
+                    local chosenKey = exactMatchKey or matchedKeys[1]
+                    
+                    if chosenKey then
                         Notify({
                             Title = "AUTO PLAY", 
-                            Content = notifText, 
+                            Content = "Memutar rekaman: " .. chosenKey, 
                             Color = Color3.fromRGB(50, 160, 100)
                         })
-                        RunPlayback(chosenKey, false)
+                        RunPlayback(chosenKey, false, 0)
                     else
-                        Notify({
-                            Title = "AUTO PLAY", 
-                            Content = "Tidak ada di list rekaman: " .. rawName, 
-                            Color = Color3.fromRGB(200, 50, 50)
-                        })
+                        local randomKey = GetValidRandomKey()
+                        if randomKey then
+                            Notify({
+                                Title = "AUTO PLAY", 
+                                Content = "Rekaman tidak ada! Random: " .. randomKey, 
+                                Color = Color3.fromRGB(255, 140, 0)
+                            })
+                            RunPlayback(randomKey, true, 0)
+                        else
+                            Notify({
+                                Title = "AUTO PLAY", 
+                                Content = "List rekaman kosong / semua di-blacklist!", 
+                                Color = Color3.fromRGB(200, 50, 50)
+                            })
+                        end
                     end
                 end
                 
@@ -1425,22 +1810,7 @@ AddToggleUI(Tabs.Surgery, "MUNCULKAN FLOATING PLAYBACK UI", false, function(Valu
     QuickFrame.Visible = Value
 end)
 
-QuickPlayBtn.MouseButton1Click:Connect(function()
-    if QuickSelectedValue ~= "" and SavedData[QuickSelectedValue] then
-        RunPlayback(QuickSelectedValue, false)
-        Notify({Title="QUICK PLAY", Content="Memutar: " .. QuickSelectedValue, Color=Color3.fromRGB(50, 160, 100)})
-    else
-        Notify({Title="ERROR", Content="Pilih rekaman di list pop-up dulu!", Color=Color3.fromRGB(200, 50, 50)})
-    end
-end)
-
-QuickStopBtn.MouseButton1Click:Connect(function()
-    GlobalStop()
-    Notify({Title="QUICK STOP", Content="Playback dihentikan", Color=Color3.fromRGB(200, 50, 50)})
-end)
-
-RefreshLists()
-
+-- [ DIALOG KONFIRMASI & TOMBOL HAPUS REKAMAN ]
 local function ShowConfirmDialog(recordName, onConfirm)
     local dialogBg = Instance.new("Frame", ScreenGui)
     dialogBg.Size = UDim2.fromScale(1, 1)
@@ -1536,3 +1906,44 @@ AddButtonUI(Tabs.Surgery, "🗑️ HAPUS REKAMAN (PERMANEN)", function()
         Notify({Title="DELETED", Content="Rekaman telah dihapus.", Color=Color3.fromRGB(200, 50, 50)})
     end)
 end)
+
+-- [ 4. FITUR ANTI-AFK OTOMATIS (Setiap 18 Menit) ]
+AntiAfkConnection = player.Idled:Connect(function()
+    pcall(function()
+        VirtualUser:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+        task.wait(1)
+        VirtualUser:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+    end)
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(1080)
+        pcall(function()
+            VirtualUser:Button1Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+            task.wait(0.5)
+            VirtualUser:Button1Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+            Notify({
+                Title = "ANTI-AFK", 
+                Content = "Aktivitas anti-AFK dijalankan (18m).", 
+                Color = Color3.fromRGB(0, 170, 255)
+            })
+        end)
+    end
+end)
+
+QuickPlayBtn.MouseButton1Click:Connect(function()
+    if QuickSelectedValue ~= "" and SavedData[QuickSelectedValue] then
+        RunPlayback(QuickSelectedValue, false, 0)
+        Notify({Title="QUICK PLAY", Content="Memutar: " .. QuickSelectedValue, Color=Color3.fromRGB(50, 160, 100)})
+    else
+        Notify({Title="ERROR", Content="Pilih rekaman di list pop-up dulu!", Color=Color3.fromRGB(200, 50, 50)})
+    end
+end)
+
+QuickStopBtn.MouseButton1Click:Connect(function()
+    GlobalStop()
+    Notify({Title="QUICK STOP", Content="Playback dihentikan", Color=Color3.fromRGB(200, 50, 50)})
+end)
+
+RefreshLists()
